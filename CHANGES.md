@@ -347,6 +347,37 @@ top_p 1.0, top_k 20, and the kit's own serve takes a top-k (20) for exactly this
 |---|---|---|---|---|---|
 | 21 | `--top-k K` (20) is the default for a request that names none; a request's own `top_k` still wins, and `0` turns it off | `frontend/src/{main.rs,server.rs}` | on | no: this changes sampling, which is the point. Greedy (`temperature` 0) is untouched, and a request that sends `top_k` is untouched | `top_k = 0` (nucleus only, whole vocabulary) -> `top_k = 20` |
 
+## Upstream performance pull requests merged in (2026-11-20)
+
+The open upstream PRs that carry cache and checkpoint work were merged on top of the v2 merge. They are
+opt-in or default-off, so a deployment that sets no new variable behaves as before.
+
+| PR | What it adds | Gate |
+|---|---|---|
+| #21 | text checkpoints under memory pressure | `DSGB10_ORDINARY_TEXT_ALTERNATES` |
+| #25 | interleaves resident text decode with chunked prefill | default on |
+| #26 | turn-tail rendering for 1017 cache reuse | `--experimental-tail-cache-render` |
+| #29 | keeps the selected text fork parent alive | default on |
+| #31 | prefers a deeper disk checkpoint for image continuations | `DSGB10_ORDINARY_IMAGE_DURABLE` |
+| #33 | retains one earlier text checkpoint for returning branches | `DSGB10_ORDINARY_TEXT_ALTERNATES` |
+| #34 | reuses deeper text checkpoints when editing an existing session | `DSGB10_ORDINARY_EXISTING_TEXT_ALTERNATES` |
+
+`#22 ⊂ #24 ⊂ #28 ⊂ #31` and `#30 ⊂ #32 ⊂ #34`, so the seven merges carry twelve PRs.
+
+PR #34 conflicted with this branch's own image restart-point selection (`88cf71e`) in `serve.cpp`. Both
+survive: `image_request` keeps its meaning for the image path, and a new `image_lineage` (image flags, spans
+or rows on the request) decides text lineage, so a resumed image request is not mistaken for an ordinary
+text turn. `src_live`, `p`, `pl` and `disk_source` are declared once before both paths.
+
+PR #9 (`vision-prefix-reuse`) was **not** merged: it reimplements image prefix reuse in the front end's
+session table, which competes with this branch's engine-side image cache (`DSGB10_ORDINARY_IMAGE_PREFIX_CACHE`,
+`image_prefix.h`, `durable_images.h`). Choosing between them is a design decision, not a merge.
+
+Checks (Linux, rustc 1.100.0): `cargo test --release --locked` 84 pass, 0 fail (75 lib + 2 bin + 3
+integration + 4 fork_wire); the five CPU extraction tests (`text_existing_handle`, `text_alternate`,
+`text_spilled_alternate`, `text_spill_stage`, `text_spill_vote`) pass. The engine's CUDA build and
+`test_kernels` need the ring (no `nvcc` here).
+
 ## Upstream v2 merged in (2026-11-20)
 
 `origin/main` moved from `7c123ad` to `3a862a4` (v2: shared-step, prompt-pass and draft-block levers, exact prefix
