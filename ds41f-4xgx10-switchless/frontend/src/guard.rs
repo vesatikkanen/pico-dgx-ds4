@@ -68,39 +68,115 @@ pub struct LoopGuard {
 
 pub const LINE_WINDOW_TOKENS: usize = 512;
 
-/// Detect repeated intentions to act, only in reasoning for requests that offer tools.
-/// A bounded line buffer makes the result independent of token and engine batch boundaries.
+/// A line of reasoning, and whether it says anything: a line at least `SUBSTANTIVE` characters long
+/// is the model reporting a finding, not stalling.
+struct Line {
+    text: String,
+    substantive: bool,
+}
+
+/// Detect a stall in reasoning: a run of short lines that only announce an intention to act, with
+/// nothing said in between. A model that stalls writes "Let me read the docs.", "OK.", "Writing."
+/// and the like for the rest of the budget and never emits the call it keeps announcing, so neither
+/// the n-gram rule (no exact period) nor the line rule (no line reaches `line_min`) sees it.
+///
+/// Only reasoning is examined, and only for a request that offers tools; a tool call resets the
+/// buffer, because a call is the progress the stall never makes. A bounded line buffer makes the
+/// result independent of token and engine batch boundaries.
 #[derive(Default)]
 pub struct ReasoningStall {
     partial: String,
     oversized: bool,
-    lines: std::collections::VecDeque<String>,
+    lines: std::collections::VecDeque<Line>,
+}
+
+/// The verbs a line that announces an action starts with, base form and gerund.
+const ACTION_VERBS: [&str; 98] = [
+    "read", "reads", "reading", "write", "writes", "writing", "make", "makes", "making", "call",
+    "calls", "calling", "go", "going", "do", "does", "doing", "check", "checks", "checking", "look",
+    "looks", "looking", "verify", "verifies", "verifying", "run", "runs", "running", "fix", "fixes",
+    "fixing", "implement", "implements", "implementing", "deploy", "deploys", "deploying", "grep",
+    "greps", "grepping", "search", "searches", "searching", "view", "views", "viewing", "create",
+    "creates", "creating", "update", "updates", "updating", "add", "adds", "adding", "edit", "edits",
+    "editing", "test", "tests", "testing", "build", "builds", "building", "commit", "commits",
+    "committing", "push", "pushes", "pushing", "pull", "pulls", "pulling", "install", "installs",
+    "installing", "enable", "enables", "enabling", "configure", "configures", "configuring",
+    "scaffold", "scaffolds", "scaffolding", "paste", "pastes", "pasting", "ask", "asks", "asking",
+    "explain", "explains", "explaining", "present", "presents", "presenting",
+];
+
+/// Words a line may open with before the verb: "let me read", "I'll write", "OK, writing".
+const LEADS: [&str; 16] = [
+    "let", "i'll", "ill", "i", "we", "we'll", "well", "now", "ok", "okay", "so", "then", "and",
+    "but", "just", "first",
+];
+
+/// Words that may sit between a lead and the verb: "let me just do it".
+const FILLERS: [&str; 8] = ["me", "us", "just", "now", "also", "then", "really", "actually"];
+
+/// Lines that announce nothing but are part of the same stall.
+const FILLER_LINES: [&str; 24] = [
+    "ok", "done", "yes", "no", "now", "enough", "final", "actually", "hmm", "wait", "right", "so",
+    "and", "but", "then", "next", "first", "finally", "good", "great", "fine", "sure", "alright",
+    "okay",
+];
+
+/// Whether a line only announces an action ("Let me read the docs.", "Writing.", "OK.").
+fn is_action(line: &str) -> bool {
+    let words: Vec<String> = line
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_ascii_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let Some(first) = words.first() else { return false };
+    if words.len() == 1 && FILLER_LINES.contains(&first.as_str()) {
+        return true;
+    }
+    if ACTION_VERBS.contains(&first.as_str()) {
+        return true;
+    }
+    if !LEADS.contains(&first.as_str()) {
+        return false;
+    }
+    // "let me just do it": skip the fillers between the lead and the verb.
+    words[1..].iter().find(|w| !FILLERS.contains(&w.as_str())).is_some_and(|w| ACTION_VERBS.contains(&w.as_str()))
 }
 
 impl ReasoningStall {
+    /// Lines kept: the window the rule looks at.
+    const WINDOW: usize = 16;
+    /// A line this long says something, so the window is not a stall.
+    const SUBSTANTIVE: usize = 40;
+    /// A line longer than this is not buffered: it is substantive anyway.
+    const MAX_LINE_BYTES: usize = 512;
+    /// How many of the window's lines must announce an action.
+    const ACTIONS: usize = 12;
+
+    /// A tool call: the progress a stall never makes, so what came before it is not a stall.
+    pub fn reset(&mut self) {
+        self.partial.clear();
+        self.oversized = false;
+        self.lines.clear();
+    }
+
     pub fn push(&mut self, text: &str) -> bool {
-        const WINDOW: usize = 24;
-        const MAX_LINE_BYTES: usize = 512;
         for c in text.chars() {
             if c == '\n' {
-                if self.oversized {
-                    self.lines.clear();
-                } else {
-                    let line = self.partial.trim();
-                    if !line.is_empty() {
-                        self.lines.push_back(line.to_owned());
-                        if self.lines.len() > WINDOW {
-                            self.lines.pop_front();
-                        }
-                        if self.lines.len() == WINDOW && self.is_stalled() {
-                            return true;
-                        }
+                let line = self.partial.trim();
+                let substantive = self.oversized || line.chars().count() >= Self::SUBSTANTIVE;
+                if substantive || !line.is_empty() {
+                    self.lines.push_back(Line { text: line.to_owned(), substantive });
+                    if self.lines.len() > Self::WINDOW {
+                        self.lines.pop_front();
                     }
                 }
                 self.partial.clear();
                 self.oversized = false;
+                if self.lines.len() == Self::WINDOW && self.is_stalled() {
+                    return true;
+                }
             } else if !self.oversized {
-                if self.partial.len() + c.len_utf8() > MAX_LINE_BYTES {
+                if self.partial.len() + c.len_utf8() > Self::MAX_LINE_BYTES {
                     self.partial.clear();
                     self.oversized = true;
                 } else {
@@ -112,24 +188,10 @@ impl ReasoningStall {
     }
 
     fn is_stalled(&self) -> bool {
-        let mut counts = std::collections::HashMap::<&str, usize>::new();
-        for line in &self.lines {
-            *counts.entry(line).or_default() += 1;
-        }
-        if counts.len() > 12 {
+        if self.lines.iter().any(|l| l.substantive) {
             return false;
         }
-        let (mut repeated, mut kinds) = (0, 0);
-        for (line, count) in counts {
-            let line = line.to_ascii_lowercase();
-            if count >= 2 && ["let me ", "i'll ", "i will ", "making ", "writing ", "reading "]
-                .iter().any(|prefix| line.starts_with(prefix))
-            {
-                repeated += count;
-                kinds += 1;
-            }
-        }
-        kinds >= 2 && repeated >= 8
+        self.lines.iter().filter(|l| is_action(&l.text)).count() >= Self::ACTIONS
     }
 }
 
@@ -269,34 +331,58 @@ mod tests {
             "Making calls.", "Let me go.", "Writing now."];
         let text = (0..24).map(|i| format!("{}\n\n", cycle[i % cycle.len()])).collect::<String>();
         let mut g = ReasoningStall::default();
-        for c in text.chars().take(text.chars().count() - 2) {
-            assert!(!g.push(&c.to_string()));
+        // one character at a time: the result does not depend on where the chunks fall
+        let mut fired = None;
+        for (i, c) in text.char_indices() {
+            if g.push(&c.to_string()) {
+                fired = Some(i);
+                break;
+            }
         }
-        assert!(g.push("\n"));
+        assert!(fired.is_some(), "a stall fed one character at a time was not seen");
+        // the same text as one chunk fires at the same place
+        let mut whole = ReasoningStall::default();
+        assert!(whole.push(&text));
+        // prose with no line breaks is not a stall
         assert!(!ReasoningStall::default().push(&text.replace('\n', " ")));
     }
 
     #[test]
     fn reasoning_intentions_match_reported_transcript() {
+        // The tail of the reported transcript: the model announces the same calls over and over.
         let text = "Making calls.\nLet me write.\nOK.\nLet me just do it.\nReading docs.\n\
                     Let me write the calls.\nOK.\nLet me write.\nI'll read the two docs.\n\
                     Let me go.\nWriting.\nOK.\nLet me make the calls.\nWriting now.\n\
                     Let me go.\nOK.\nLet me write the calls.\nReading docs.\nLet me go.\n\
-                    OK writing.\nLet me make the calls.\nWriting.\nOK.\nLet me write.";
-        let mut g = ReasoningStall::default();
-        assert!(!g.push(text));
-        assert!(g.push("\n"));
+                    OK writing.\nLet me make the calls.\nWriting.\nOK.\nLet me write.\n";
+        assert!(ReasoningStall::default().push(text));
     }
 
     #[test]
     fn reasoning_intentions_are_conservative() {
-        let mut g = ReasoningStall::default();
-        assert!(!g.push(&"OK.\nWriting.\n".repeat(12)));
-        assert!(!ReasoningStall::default().push(&(0..24).map(|i| format!("Let me inspect item {i}.\n")).collect::<String>()));
+        // Two phrases alternating is a stall too: nothing is said between them.
+        assert!(ReasoningStall::default().push(&"OK.\nWriting.\n".repeat(12)));
+        // A line that says something ends the stall: the model is reporting a finding.
+        let finding = "The manifest lists three services and one function binding for the module.\n";
+        assert!(!ReasoningStall::default().push(&format!("{}{}", "Let me read.\n".repeat(8), finding)));
+        // Distinct subjects are work, not a stall.
+        assert!(!ReasoningStall::default().push(
+            &(0..24).map(|i| format!("Let me inspect item {i}.\n")).collect::<String>()));
+        // Code and lists are not reasoning about actions.
         assert!(!ReasoningStall::default().push(&"    return value;\n}\n".repeat(12)));
-        let oversized = format!("{}\n", "x".repeat(513));
+        assert!(!ReasoningStall::default().push(
+            &(1..25).map(|i| format!("{i}. Install the dependency and restart the service.\n")).collect::<String>()));
+        // A tool call is progress: it clears what came before, so two short runs either side of one
+        // do not add up to a stall.
         let mut g = ReasoningStall::default();
-        assert!(!g.push(&format!("{}{}{}", "Let me read.\nI'll write.\n".repeat(6), oversized,
-            "Let me read.\nI'll write.\n".repeat(6))));
+        assert!(!g.push(&"Let me read.\nOK.\n".repeat(4)));
+        g.reset();
+        assert!(!g.push(&"Let me read.\nOK.\n".repeat(4)));
+        // Without the reset the same two runs are one stall.
+        assert!(ReasoningStall::default().push(&"Let me read.\nOK.\n".repeat(8)));
+        // A very long line is substantive even though it is not buffered.
+        let mut g = ReasoningStall::default();
+        assert!(!g.push(&format!("{}{}{}", "Let me read.\n".repeat(8), format!("{}\n", "x".repeat(513)),
+            "Let me read.\n".repeat(8))));
     }
 }

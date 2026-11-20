@@ -866,10 +866,15 @@ impl Gen {
                             self.stopped = Some(Finish::Stop);
                             self.app.engine.cancel(self.req_id);
                         } else if let Some(guard) = &mut self.reasoning_stall {
-                            let stalled = out[before..].iter().any(|d| match d {
-                                Delta::Reasoning(text) => guard.push(text),
-                                _ => false,
-                            });
+                            let mut stalled = false;
+                            for d in &out[before..] {
+                                match d {
+                                    Delta::Reasoning(text) => stalled |= guard.push(text),
+                                    // a call is the progress a stall never makes
+                                    Delta::ToolCall(..) | Delta::ToolCallStart(..) => guard.reset(),
+                                    _ => {}
+                                }
+                            }
                             if stalled {
                                 self.abort_loop("repeated reasoning intentions");
                             }

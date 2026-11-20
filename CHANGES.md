@@ -335,19 +335,23 @@ tool-call parsing error.
 ### Mixed-length reasoning stalls
 
 The short-line rule can miss a stall when similar intentions appear in mixed order alongside longer lines.
-For requests with tools, the frontend now also examines completed **reasoning** lines: in a rolling window of
-24 non-empty lines, at most 12 distinct lines, with at least eight occurrences of at least two repeated
-action-intention phrases, triggers cancellation. Partial lines are buffered across token and engine batches;
-individual lines over 512 bytes clear the window. This conservative heuristic can still produce false positives
-and cannot detect every possible loop. It does not inspect normal answer text or tool arguments. All loop guards
+For requests with tools, the frontend now also examines completed **reasoning** lines. A rolling window of 16
+lines is a stall when none of them says anything (every line is under 40 characters) and at least 12 of them
+only announce an action ("Let me read the docs.", "Writing.", "OK."). A tool call clears the window, because a
+call is the progress a stall never makes. Partial lines are buffered across token and engine batches, so the
+result does not depend on where the chunks fall.
+
+On the reported transcript this fires at line 215 of 271; the previous rules fired at line 270, and the
+`short_lines` rule alone never fired at all. This is still a heuristic: it can produce false positives, and it
+cannot detect every possible loop. It does not inspect normal answer text or tool arguments. All loop guards
 remain disabled by `--no-loop-guard`.
 
 A detected loop is now reported as an error (HTTP 500 for non-streaming requests, an error event followed by
 `[DONE]` for streams), rather than a successful `finish_reason: stop`. Already streamed output cannot be
 withdrawn, and a client can still choose to retry the error. The cancelled text session is retired and released
 once the engine and any dependent forks are finished. The regression tests cover an excerpt of the reported
-transcript, chunk boundaries, ordinary text, both API response modes, and session ownership. GPU deployment and
-the behavior of individual clients have not been verified by these tests.
+transcript, chunk boundaries, ordinary text, code, lists, both API response modes, and session ownership. GPU
+deployment and the behavior of individual clients have not been verified by these tests.
 
 ## A request that names no sampling parameter gets the family's sampler (2026-11-20)
 
