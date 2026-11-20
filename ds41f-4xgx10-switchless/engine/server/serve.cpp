@@ -45,7 +45,9 @@
 // indexes its file (state.cu); this server writes their histories beside it (keep). The next start
 // whose store reused those files reads them back in (load_kept), and the front-end's session ids find
 // their sessions as before the stop.
+#include "dspark/dspark.h"
 #include "server/serve.h"
+#include "server/copy.h"
 
 #include <poll.h>
 #include <signal.h>
@@ -139,6 +141,7 @@ struct Request {
   // vision (fe::kFlagImages): the image spans and their rows, bf16 [sum rows][kImageDim]; empty for text
   std::vector<fe::ImageSpan> spans;
   std::vector<uint16_t> img;
+  std::vector<int32_t> pred;  // copy drafts (fe::kFlagPrediction): the client's prediction as token ids
 };
 
 struct Event {
@@ -264,13 +267,20 @@ class Io {
       Request& r = e.rq;
       if (p.size() < sizeof r.h) return false;
       std::memcpy(&r.h, p.data(), sizeof r.h);
-      const size_t base = sizeof r.h + 4 * (size_t(r.h.n_stop_ids) + r.h.n_prompt);
+      const size_t npred = (r.h.flags & fe::kFlagPrediction) ? r.h.reserved : 0;  // copy drafts: the prediction
+      const size_t base = sizeof r.h + 4 * (size_t(r.h.n_stop_ids) + r.h.n_prompt + npred);
       if (!(r.h.flags & fe::kFlagImages) ? p.size() != base : p.size() < base + 4) return false;
       r.stop.resize(r.h.n_stop_ids);
       r.prompt.resize(r.h.n_prompt);
       const char* a = p.data() + sizeof r.h;
       if (!r.stop.empty()) std::memcpy(r.stop.data(), a, r.stop.size() * 4);
       if (!r.prompt.empty()) std::memcpy(r.prompt.data(), a + r.stop.size() * 4, r.prompt.size() * 4);
+      if (npred) {
+        r.pred.resize(std::min<size_t>(npred, 1u << 18));
+        std::memcpy(r.pred.data(), a + (r.stop.size() + r.prompt.size()) * 4, r.pred.size() * 4);
+        for (int32_t& t : r.pred)
+          if (t < 0 || t >= model::kVocab) t = -1;  // never a draft
+      }
       if (r.h.flags & fe::kFlagImages) {  // vision: n, the spans, their rows
         uint32_t ni = 0;
         std::memcpy(&ni, p.data() + base, 4);
@@ -373,7 +383,30 @@ struct Session {
   int dec_lo = 0, end_dec_lo = 0;
   std::vector<int> enc_snaps;
   double t_used = 0;  // unix time of its last request (kept sessions age out by it)
+  // WARM (DSGB10_REUSE_EXACT): positions [0, pf) of the history hold what the prefill path computed (a cold
+  // prefill's bits); from pf on they are the decode step's (generated tokens, a step of prompt rows)
+  int pf = 0;
 };
+
+// WARM: DSGB10_REUSE_EXACT=L (default 0: as before).
+//   1: a prompt's short remainder (at most --small-rows positions after the restart point) runs through the prefill
+//      path, not as a decode step. The step and the prefill sum in different orders, so the step's rerun of a
+//      prefilled position left a state that is not the cold prefill's: the same request again (its whole prompt
+//      reused but the last position) gave a different greedy text at close calls. With 1 it gives the cold text.
+//   2: also, a request restarts only where every earlier position came from the prefill path (never inside or after
+//      generated tokens, which the decode step computed), and where the turn runs as a cold prefill would (CED: at
+//      least 128 positions before the prompt's end, when the prompt has 128). Then every reply is the cold reply of
+//      its prompt, whatever the engine holds; a follow-up turn prefills the previous answer again.
+// A time-sliced request's resume keeps the step (it reruns a position the step computed).
+int reuse_exact() {
+  static const int v = [] {
+    const char* e = getenv("DSGB10_REUSE_EXACT");
+    const int x = e ? atoi(e) : 0;
+    if (x) std::printf("serve: DSGB10_REUSE_EXACT=%d\n", x);
+    return x;
+  }();
+  return v;
+}
 
 // The server's index of a planned stop's kept sessions (keep(); keepfile.h: 0600 in a 0700 directory,
 // whole or not at all): a header, then each session: id, handle, restart ranges, LRU clock and time,
@@ -535,6 +568,7 @@ class Server {
         Session s;
         s.h = r.get<int32_t>(), s.pe_snap = r.get<int32_t>();
         s.end_lo = r.get<int32_t>(), s.end_clo = r.get<int32_t>(), s.end_w = r.get<int32_t>(), s.end_dec_lo = r.get<int32_t>();
+        s.pf = r.get<int32_t>();
         s.used = r.get<uint64_t>();
         s.t_used = r.get<double>();
         const int nh = r.get<int32_t>(), ne = r.get<int32_t>();
@@ -655,6 +689,7 @@ class Server {
       ++n;
       put<uint64_t>(f, id), put<int32_t>(f, s.h), put<int32_t>(f, s.pe_snap);
       put<int32_t>(f, s.end_lo), put<int32_t>(f, s.end_clo), put<int32_t>(f, s.end_w), put<int32_t>(f, s.end_dec_lo);
+      put<int32_t>(f, s.pf);
       put<uint64_t>(f, s.used), put<double>(f, s.t_used);
       put<int32_t>(f, (int32_t)s.hist.size()), put<int32_t>(f, (int32_t)s.enc_snaps.size());
       for (const int32_t t : s.hist) put<int32_t>(f, t);
@@ -803,11 +838,18 @@ class Server {
     Plan best;
     const model::Model::StateInfo info = m_.state_info(s.h);
     p = live ? p : std::min(p, info.saved);  // a stored session's compressed caches go as far as its pages
+    const int lvl = reuse_exact();
+    if (lvl >= 2) p = std::min(p, s.pf);  // WARM: never from positions the decode step computed
     auto consider = [&](int q, int how, int snap) {
       if (q > best.q) best = Plan{q, how, snap};
     };
     // CED: a restart at q leaving fewer than 128 positions needs the decoder's rings valid at q
-    auto usable = [&](int q, bool dec_ok) { return !o_.ced || n - q >= kReplay || dec_ok; };
+    // (WARM level 2: and a prompt of 128 or more always runs CED, as its cold prefill does)
+    auto usable = [&](int q, bool dec_ok) {
+      if (!o_.ced) return true;
+      if (lvl >= 2) return n - q >= kReplay || (dec_ok && n < kReplay);
+      return n - q >= kReplay || dec_ok;
+    };
     // with the ring and the carries as they were at position `end` (exact for [max(lo, w - 256), end)
     // and [max(clo, w - 16), end)), at most at `cap`
     auto from_ring = [](int end, int cap, int lo, int clo, int w) {
@@ -906,7 +948,10 @@ class Server {
     }
     f.sp.temperature = h.temperature;
     f.sp.top_p = h.top_p;
-    f.sp.top_k = (int32_t)std::min<uint32_t>(h.top_k, 1u << 30);
+    // couple (DSGB10_GSAMPLE): the Gumbel-path bit rides in top_k (model.h); without the variable this is the old value
+    // (a top-k of 2^30 or more keeps every token either way)
+    f.sp.top_k = model::gsample_top_k((int32_t)std::min<uint32_t>(h.top_k, (1u << 30) - 1), h.temperature, h.top_p,
+                                      (h.flags & fe::kFlagSeed) != 0);
     f.sp.n_top = (h.flags & fe::kFlagLogprobs) ? (int32_t)std::min<uint32_t>(h.n_top_logprobs, model::ops::kTopLogprobs) : 0;
     // stack4: a request that wants logprobs keeps the full head (the certified head gives the argmax, not the partition sum)
     if ((h.flags & fe::kFlagLogprobs) && f.sp.n_top < 1) f.sp.n_top = 1;
@@ -967,6 +1012,9 @@ class Server {
     const int p = src ? std::min(lcp(src->hist, prompt), n - 1) : 0;
     const Plan pl = src ? choose(*src, src_live, p, n) : Plan{};
     const int q = pl.q;
+    const int lvl = reuse_exact();
+    const int src_pf = src ? src->pf : 0;  // WARM: the source's prefill frontier (S may be src: read it now)
+    bool all_pf = true;                    // every row of this run went through the prefill path
     NVTX_RANGE("req %llu new %d ctx %d %s", (unsigned long long)h.req_id, n - q, n, kHow[pl.how]);
     if (!resume) {
       f.q = q, f.pl = pl;
@@ -1041,8 +1089,31 @@ class Server {
       Cmd c{};
       c.op = kCmdTokens;
       c.slot = s;
-      c.pos0 = std::max(0, q - 3);
+      // copy drafts (server/copy.h): every rank's matcher reads the whole prompt, so it goes from position 0
+      static const bool copy_on = CopyKnobs::get().on && m_.spec_copy();
+      c.pos0 = copy_on ? 0 : std::max(0, q - 3);
+      // copy drafts (DSGB10_COPY_DELTA): every rank's history of the slot is this rank's (the same commands and steps); what
+      // it holds of the prompt already is not sent again: from the first token that differs, at most q - 3 (the start
+      // without copy drafts). A slot that held another sequence gets the whole prompt.
+      static const bool delta_on = copy_on && CopyKnobs::get().delta;
+      if (delta_on) {
+        const std::vector<int32_t>& hh = m_.history(s);
+        const int lim = std::min<int>((int)hh.size(), std::max(0, q - 3));
+        int L = 0;
+        if (f.rq.spans.empty()) {
+          while (L < lim && hh[L] == prompt[L]) ++L;
+        } else {  // vision: the history holds -1 at image positions
+          std::vector<int32_t> w(prompt.begin(), prompt.begin() + lim);
+          for (const fe::ImageSpan& sp : f.rq.spans)
+            for (int k = sp.start; k < (int)(sp.start + sp.rows) && k < lim; ++k) w[k] = -1;
+          while (L < lim && hh[L] == w[L]) ++L;
+        }
+        c.pos0 = L;
+        c.delta = 1;
+        c.hist_hash = copy_hist_hash(hh.data(), L);
+      }
       c.n = n - c.pos0;
+      c.n_pred = copy_on ? (int)f.rq.pred.size() : 0;
       if (v.size() > (size_t)kMaxOps) die("serve: %zu state operations for one command", v.size());
       c.n_ops = (int)v.size();
       std::copy(v.begin(), v.end(), c.ops);
@@ -1060,6 +1131,10 @@ class Server {
         for (int k = std::max<int>(sp.start, c.pos0); k < (int)(sp.start + sp.rows); ++k) t[k - c.pos0] = -1;
       bcast_payload(ring_, t.data(), t.size() * 4, 0);
       m_.set_tokens(c.pos0, c.n, t.data());
+      if (copy_on) {  // the request's prediction, to every rank (none: the slot's earlier one is dropped)
+        if (c.n_pred > 0) bcast_payload(ring_, f.rq.pred.data(), f.rq.pred.size() * 4, 0);
+        set_prediction(s, f.rq.pred.data(), c.n_pred);
+      }
       if (!f.rq.spans.empty()) images(f.rq);
       tu.ops_ms = 1e3 * (now_s() - (resume ? t0 : f.t_start));
     }
@@ -1087,7 +1162,11 @@ class Server {
       wd_.started = now_s();
       bool img = false;  // vision: rows of an image span take the chunk path (the step path has no injection)
       for (const fe::ImageSpan& sp : f.rq.spans) img = img || (int)(sp.start + sp.rows) > pos;
-      if (R <= o_.small_rows && !ced && !img) {
+      // WARM: a prompt's remainder keeps the prefill path. INTEG: except a prompt of at most --small-rows positions, which a
+      // cold run computes as one decode step (so with the level on, a cold short prompt still gives today's reply)
+      const bool step_ok = resume || lvl < 1 || n <= o_.small_rows;
+      if (R <= o_.small_rows && !ced && !img && step_ok) {
+        all_pf = false;
         c.op = kCmdRows;
         std::copy(prompt.begin() + pos, prompt.begin() + pos + R, c.tokens);
         issue(c);
@@ -1095,12 +1174,12 @@ class Server {
         first = m_.wait(k);
         tu.rows_ms += m_.last_gpu_ms();
         first_row = R - 1;
-        S->w = std::max(S->w, pos + R + (m_.spec() ? model::ops::kDrafts : 0));  // its draft's block keys
+        S->w = std::max(S->w, pos + R + (m_.spec() ? std::max(dspark::draft_rows(), dspark::draft_rows_batch()) : 0));  // its draft's block keys
       } else {
         c.op = kCmdPrefill;
         c.flags = (last ? kPfSample : 0) | (ced ? kPfCed : 0);
         const int rest = n - pos - R;
-        c.next = rest > o_.small_rows || (ced && rest > 0) ? std::min(o_.prefill_rows, rest) : 0;
+        c.next = rest > o_.small_rows || ((ced || !step_ok) && rest > 0) ? std::min(o_.prefill_rows, rest) : 0;
         for (int i = 0; i < c.n_snaps; ++i)
           if (ced && c.snaps[i] < n) S->enc_snaps.push_back(c.snaps[i]);  // the replay covers only one at n
         issue(c);
@@ -1123,6 +1202,8 @@ class Server {
       issue(c);
       m_.set_images(0, nullptr, nullptr, nullptr);
     }
+    // WARM: [0, pos) is the prefill path's when this run was, from a restart at or below the source's frontier
+    S->pf = all_pf && q <= src_pf ? pos : std::min(src_pf, q);
     const double t_first = now_s();
     if (resume) f.resume_s += t_first - t0;
     else f.t_first = t_first;
@@ -1507,11 +1588,15 @@ class Server {
     const model::Model::StateInfo si = S ? m_.state_info(S->h) : model::Model::StateInfo{};
     const DecodeEnd* de = &f.de;
     if (de->vsteps) {
+      char h67[48] = "";  // blk7: only with longer blocks, so the default log line is the old one
+      if (dspark::draft_rows() > dspark::kDraftModel || dspark::draft_rows_batch() > dspark::kDraftModel)
+        std::snprintf(h67, sizeof h67, " 6..7: %d %d;", de->rows_hist[6], de->rows_hist[7]);
       std::printf("serve: req %llu drafts: %d verify steps, %.2f drafts verified and %.2f accepted per step, "
-                  "steps verifying 0..5: %d %d %d %d %d %d; gate %.3f (%.3f-%.3f); GPU ms by rows:",
+                  "steps verifying 0..5: %d %d %d %d %d %d;%s gate %.3f (%.3f-%.3f); GPU ms by rows:",
                   (unsigned long long)h.req_id, de->vsteps, (double)de->verified / de->vsteps,
                   (double)de->accepted / de->vsteps, de->rows_hist[0], de->rows_hist[1], de->rows_hist[2],
-                  de->rows_hist[3], de->rows_hist[4], de->rows_hist[5], de->gate_sum / std::max(1, de->gate_n),
+                  de->rows_hist[3], de->rows_hist[4], de->rows_hist[5], h67,
+                  de->gate_sum / std::max(1, de->gate_n),
                   de->gate_min, de->gate_max);
       for (int r = 1; r <= model::ops::kDrafts + 1; ++r)
         if (de->gpu_n[r]) std::printf(" %d: %.2f (%d)", r, de->gpu_ms[r] / de->gpu_n[r], de->gpu_n[r]);
