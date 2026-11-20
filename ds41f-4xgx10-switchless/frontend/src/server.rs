@@ -8,7 +8,7 @@
 use crate::encoding::{api_tool_name, encode_messages_with_tail, Delta, EncodeOptions, Encoding, ParsedMessage, StreamParser, ThinkingMode};
 use crate::engine::{EngineClient, Event as EngineEvent};
 use crate::gate::{Gate, Pass, Refused, RETRY_AFTER_S};
-use crate::guard::{LoopGuard, StopMatcher, LINE_WINDOW_TOKENS};
+use crate::guard::{LoopGuard, ReasoningStall, StopMatcher, LINE_WINDOW_TOKENS};
 use crate::protocol::{DoneReason, Submit, FLAG_KEEP, FLAG_SEED};
 use crate::pyjson::truthy;
 use crate::session::{Plan, SessionTable};
@@ -814,6 +814,8 @@ struct Gen {
     stop_ids: Vec<u32>,
     stopper: StopMatcher,
     parser: StreamParser,
+    reasoning_stall: Option<ReasoningStall>,
+    loop_detected: bool,
     dec: StreamDecoder,
     /// every id the engine sent (the session holds these)
     ids: Vec<u32>,
@@ -858,10 +860,19 @@ impl Gen {
                         let mut text = String::new();
                         self.dec.push(&self.app.tok, id, &mut text);
                         let (pass, hit) = self.stopper.push(&text);
+                        let before = out.len();
                         self.parser.push(&pass, out);
                         if hit {
                             self.stopped = Some(Finish::Stop);
                             self.app.engine.cancel(self.req_id);
+                        } else if let Some(guard) = &mut self.reasoning_stall {
+                            let stalled = out[before..].iter().any(|d| match d {
+                                Delta::Reasoning(text) => guard.push(text),
+                                _ => false,
+                            });
+                            if stalled {
+                                self.abort_loop("repeated reasoning intentions");
+                            }
                         }
                     }
                     if self.stopped.is_none() {
@@ -870,10 +881,8 @@ impl Gen {
                             let from = out_ids.len().saturating_sub(LINE_WINDOW_TOKENS);
                             let start = if from == 0 { 0 } else { self.gen_ends[from - 1] };
                             let tail = String::from_utf8_lossy(&self.gen_bytes[start..]);
-                            if let Some(keep) = g.check(out_ids, &tail) {
-                                eprintln!("req {}: repetition loop after {} tokens; keeping {keep}", self.req_id, out_ids.len());
-                                self.stopped = Some(Finish::Stop);
-                                self.app.engine.cancel(self.req_id);
+                            if g.check(out_ids, &tail).is_some() {
+                                self.abort_loop("repeated output");
                             }
                         }
                     }
@@ -883,6 +892,12 @@ impl Gen {
                 }
                 EngineEvent::Done(d) => {
                     self.done = true;
+                    if self.loop_detected {
+                        if self.is_image {
+                            self.app.engine.release(self.session_id);
+                        }
+                        return Some(Err("generation stopped: repetition loop detected before the model completed its response".into()));
+                    }
                     if d.reason == DoneReason::Error {
                         if self.is_image {
                             self.app.engine.release(self.session_id);
@@ -964,6 +979,17 @@ impl Gen {
                 }
             }
         }
+    }
+
+    fn abort_loop(&mut self, kind: &str) {
+        eprintln!("req {}: {kind} after {} tokens; cancelling generation", self.req_id, self.kept);
+        self.loop_detected = true;
+        self.stopped = Some(Finish::Stop);
+        if !self.is_image {
+            let released = self.app.sessions.lock().unwrap().retire(self.session_id);
+            self.app.release_sessions(released);
+        }
+        self.app.engine.cancel(self.req_id);
     }
 
     fn remember_session(&self) {
@@ -1100,6 +1126,8 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
         parser: parser(&app.cfg, p),
+        reasoning_stall: (app.cfg.loop_guard.is_some() && p.tools).then(ReasoningStall::default),
+        loop_detected: false,
         dec: StreamDecoder::default(),
         ids: Vec::new(),
         kept: 0,
@@ -1188,6 +1216,8 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         stop_ids,
         stopper: StopMatcher::new(p.stops.clone()),
         parser: parser(&app.cfg, p),
+        reasoning_stall: (app.cfg.loop_guard.is_some() && p.tools).then(ReasoningStall::default),
+        loop_detected: false,
         dec: StreamDecoder::default(),
         ids: Vec::new(),
         kept: 0,

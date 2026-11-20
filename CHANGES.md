@@ -327,17 +327,34 @@ leaves its reasoning. It writes short lines from four phrases in no fixed order 
 
 | # | Change | Files | Default | Same output | Before -> after |
 |---|---|---|---|---|---|
-| 20 | `LoopGuard` stops a run of `short_lines` (24) non-empty lines, each shorter than `line_min` and drawn from at most `short_distinct` (6) different texts | `frontend/src/guard.rs` | on | yes: a guard that fires only on a stall, and prose of short lines has too many different ones | the stall above ran to `max_tokens` with no tool call -> the request ends at the stall |
+| 20 | `LoopGuard` stops a run of `short_lines` (24) non-empty lines, each shorter than `line_min` and drawn from at most `short_distinct` (6) different texts | `frontend/src/guard.rs` | on | no: sufficiently repetitive legitimate output can also match | the stall above ran to `max_tokens` with no tool call -> the request ends at the stall |
 
 The two parser fixes above are real but are not this bug: a reply that never carries a tool call cannot be a
 tool-call parsing error.
+
+### Mixed-length reasoning stalls
+
+The short-line rule can miss a stall when similar intentions appear in mixed order alongside longer lines.
+For requests with tools, the frontend now also examines completed **reasoning** lines: in a rolling window of
+24 non-empty lines, at most 12 distinct lines, with at least eight occurrences of at least two repeated
+action-intention phrases, triggers cancellation. Partial lines are buffered across token and engine batches;
+individual lines over 512 bytes clear the window. This conservative heuristic can still produce false positives
+and cannot detect every possible loop. It does not inspect normal answer text or tool arguments. All loop guards
+remain disabled by `--no-loop-guard`.
+
+A detected loop is now reported as an error (HTTP 500 for non-streaming requests, an error event followed by
+`[DONE]` for streams), rather than a successful `finish_reason: stop`. Already streamed output cannot be
+withdrawn, and a client can still choose to retry the error. The cancelled text session is retired and released
+once the engine and any dependent forks are finished. The regression tests cover an excerpt of the reported
+transcript, chunk boundaries, ordinary text, both API response modes, and session ownership. GPU deployment and
+the behavior of individual clients have not been verified by these tests.
 
 ## A request that names no sampling parameter gets the family's sampler (2026-11-20)
 
 The same checkpoint served by two engines behaves differently: one emits the tool call, the other stalls in its
 reasoning. The prompt is not the difference — `dsfront enccheck` is byte-exact against `encoding.py`, and the
 assistant turn's call and the tool result round-trip through `render_tool_calls` / `merge_tool_messages` exactly as
-the reference writes them. The sampler is.
+the reference writes them. The sampler is one difference, not a proven sole cause of the stall.
 
 `top_k` had no server default: a request that named neither `top_p` nor `top_k` got `top_k = 0`, the nucleus alone
 over all 128k logits. That is not the family's sampler. The model card's recommended sampling is temperature 1.0,

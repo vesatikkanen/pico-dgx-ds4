@@ -95,3 +95,27 @@ fn byte_pressure_cannot_evict_reserved_source() {
     assert!(release.contains(&base));
     assert_eq!(t.len(),1);
 }
+
+#[test]
+fn retired_pending_parent_waits_for_engine_and_fork() {
+    let tok=tokenizer(); let mut t=SessionTable::new(20,16<<20);
+    let orig=text('A'); let base=put(&mut t,&tok,&orig);
+    let (parent,_)=t.plan(&orig,&tok,1);
+    let (fork,_)=t.plan(&orig.replace("tail","fork"),&tok,1);
+    assert_eq!(parent.session_id,base);
+    assert_eq!(fork.base_session_id,base);
+    assert!(t.retire(base).is_empty());
+    let (next,_)=t.plan(&orig,&tok,1);
+    assert_ne!(next.session_id,base); assert_ne!(next.base_session_id,base);
+    assert!(!t.terminal(fork.session_id,base,true).contains(&base));
+    assert_eq!(t.terminal(base,0,false).iter().filter(|&&id|id==base).count(),1);
+}
+
+#[test]
+fn retirement_after_terminal_releases_once() {
+    let tok=tokenizer(); let mut t=SessionTable::new(20,16<<20);
+    let (p,_)=t.plan(&text('A'),&tok,1);
+    assert!(t.terminal(p.session_id,p.base_session_id,false).is_empty());
+    assert_eq!(t.retire(p.session_id),vec![p.session_id]);
+    assert!(t.retire(p.session_id).is_empty());
+}

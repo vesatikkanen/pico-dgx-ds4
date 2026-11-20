@@ -155,6 +155,110 @@ mod fork_wire {
         exercise(None).await;
     }
 
+    async fn reasoning_loop_response(stream: bool) {
+        use crate::protocol::Tokens;
+
+        let path = SocketPath(std::env::temp_dir().join(format!(
+            "pico-reasoning-loop-{}-{stream}.sock", std::process::id()
+        )));
+        let listener = UnixListener::bind(&path.0).unwrap();
+        let engine = EngineClient::start(path.0.clone());
+        let mut peer = connect(&listener, &engine).await;
+        let mut config = cfg();
+        config.loop_guard = Some(LoopGuard::default());
+        let app = App::new(config, tokenizer(), engine);
+        let body = json!({
+            "messages": [{"role": "user", "content": "Read the documentation"}],
+            "thinking": {"type": "enabled"}, "stream": stream, "max_tokens": 2048,
+            "tools": [{"type": "function", "function": {"name": "read_doc",
+                "description": "Read a document", "parameters": {"type": "object", "properties": {}}}}]
+        });
+        let request = tokio::spawn({
+            let app = app.clone();
+            async move {
+                let response = chat(State(app), HeaderMap::new(), Bytes::from(body.to_string())).await;
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                (status, bytes)
+            }
+        });
+        let submitted = submit(&mut peer).await;
+        let lines = ["Let me read the docs.", "OK.", "Let me write the calls.",
+            "Making calls.", "Let me go.", "Writing now."];
+        let text = (0..24).map(|i| format!("{}\n\n", lines[i % lines.len()])).collect::<String>();
+        let ids = app.tok.encode_parallel(&text, 1);
+        for chunk in ids.chunks(if stream { 37 } else { ids.len() }) {
+            peer.write_all(&Frame::Tokens(Tokens {
+                req_id: submitted.req_id, ids: chunk.to_vec(), logprobs: None, top: None,
+            }).encode()).await.unwrap();
+        }
+        assert_eq!(receive(&mut peer).await, Frame::Cancel { req_id: submitted.req_id });
+        done(&mut peer, &submitted, DoneReason::Cancelled).await;
+        assert_eq!(receive(&mut peer).await, Frame::Release { session_id: submitted.session_id });
+
+        let (status, bytes) = timeout(DEADLINE, request).await.unwrap().unwrap();
+        assert_eq!(status, if stream { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR });
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("repetition loop detected"), "{body}");
+        assert!(!body.contains("\"finish_reason\":\"stop\""), "{body}");
+        if stream {
+            assert!(body.contains("[DONE]"));
+        }
+        assert_eq!(app.sessions.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn reasoning_loop_returns_error_and_releases_session() {
+        reasoning_loop_response(false).await;
+        reasoning_loop_response(true).await;
+    }
+
+    #[tokio::test]
+    async fn reasoning_detector_respects_scope_and_disable_flag() {
+        use crate::protocol::Tokens;
+
+        for (tools, thinking, enabled) in [(false, true, true), (true, false, true), (true, true, false)] {
+            let path = SocketPath(std::env::temp_dir().join(format!(
+                "pico-reasoning-scope-{}-{tools}-{thinking}-{enabled}.sock", std::process::id()
+            )));
+            let listener = UnixListener::bind(&path.0).unwrap();
+            let engine = EngineClient::start(path.0.clone());
+            let mut peer = connect(&listener, &engine).await;
+            let mut config = cfg();
+            config.loop_guard = enabled.then(LoopGuard::default);
+            let app = App::new(config, tokenizer(), engine);
+            let mut body = json!({
+                "messages": [{"role": "user", "content": "Read the documentation"}],
+                "thinking": {"type": if thinking { "enabled" } else { "disabled" }},
+                "max_tokens": 2048
+            });
+            if tools {
+                body["tools"] = json!([{"type": "function", "function": {"name": "read_doc",
+                    "parameters": {"type": "object", "properties": {}}}}]);
+            }
+            let request = tokio::spawn({
+                let app = app.clone();
+                async move { chat(State(app), HeaderMap::new(), Bytes::from(body.to_string())).await }
+            });
+            let submitted = submit(&mut peer).await;
+            let text = "Making calls.\nLet me write.\nOK.\nLet me just do it.\nReading docs.\n\
+                Let me write the calls.\nOK.\nLet me write.\nI'll read the two docs.\n\
+                Let me go.\nWriting.\nOK.\nLet me make the calls.\nWriting now.\n\
+                Let me go.\nOK.\nLet me write the calls.\nReading docs.\nLet me go.\n\
+                OK writing.\nLet me make the calls.\nWriting.\nOK.\nLet me write.\n";
+            peer.write_all(&Frame::Tokens(Tokens {
+                req_id: submitted.req_id, ids: app.tok.encode_parallel(text, 1), logprobs: None, top: None,
+            }).encode()).await.unwrap();
+            done(&mut peer, &submitted, DoneReason::Length).await;
+            let response = timeout(DEADLINE, request).await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "tools={tools}, thinking={thinking}, enabled={enabled}");
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["choices"][0]["finish_reason"], "length");
+            assert_eq!(app.sessions.lock().unwrap().len(), 1);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blocked_terminal_callback_does_not_block_other_stream_tokens() {
         use crate::protocol::Tokens;

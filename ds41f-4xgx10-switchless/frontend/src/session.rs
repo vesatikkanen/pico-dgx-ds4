@@ -373,6 +373,18 @@ impl SessionTable {
         self.evict(0)
     }
 
+    /// Stop matching a failed response without releasing state still owned by the engine.
+    pub fn retire(&mut self, session_id: u64) -> Vec<u64> {
+        if let Some(s) = self.sessions.get_mut(&session_id) {
+            s.retired = true;
+            if !s.pending && s.dependents == 0 {
+                self.sessions.remove(&session_id);
+                return vec![session_id];
+            }
+        }
+        Vec::new()
+    }
+
     /// Complete engine ownership independently of the client reading its output. A failed
     /// destination stops matching immediately, but its engine state can still serve older
     /// fork requests that already selected it.
@@ -380,7 +392,7 @@ impl SessionTable {
         let mut released = Vec::new();
         if let Some(s) = self.sessions.get_mut(&session_id) {
             s.pending = false;
-            if failed {
+            if failed || s.retired {
                 s.retired = true;
                 if s.dependents == 0 {
                     self.sessions.remove(&session_id);
@@ -390,7 +402,7 @@ impl SessionTable {
         }
         if let Some(base) = self.sessions.get_mut(&base_session_id) {
             base.dependents -= 1;
-            if base.retired && base.dependents == 0 {
+            if base.retired && !base.pending && base.dependents == 0 {
                 self.sessions.remove(&base_session_id);
                 released.push(base_session_id);
             }

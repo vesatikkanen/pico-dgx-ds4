@@ -68,6 +68,71 @@ pub struct LoopGuard {
 
 pub const LINE_WINDOW_TOKENS: usize = 512;
 
+/// Detect repeated intentions to act, only in reasoning for requests that offer tools.
+/// A bounded line buffer makes the result independent of token and engine batch boundaries.
+#[derive(Default)]
+pub struct ReasoningStall {
+    partial: String,
+    oversized: bool,
+    lines: std::collections::VecDeque<String>,
+}
+
+impl ReasoningStall {
+    pub fn push(&mut self, text: &str) -> bool {
+        const WINDOW: usize = 24;
+        const MAX_LINE_BYTES: usize = 512;
+        for c in text.chars() {
+            if c == '\n' {
+                if self.oversized {
+                    self.lines.clear();
+                } else {
+                    let line = self.partial.trim();
+                    if !line.is_empty() {
+                        self.lines.push_back(line.to_owned());
+                        if self.lines.len() > WINDOW {
+                            self.lines.pop_front();
+                        }
+                        if self.lines.len() == WINDOW && self.is_stalled() {
+                            return true;
+                        }
+                    }
+                }
+                self.partial.clear();
+                self.oversized = false;
+            } else if !self.oversized {
+                if self.partial.len() + c.len_utf8() > MAX_LINE_BYTES {
+                    self.partial.clear();
+                    self.oversized = true;
+                } else {
+                    self.partial.push(c);
+                }
+            }
+        }
+        false
+    }
+
+    fn is_stalled(&self) -> bool {
+        let mut counts = std::collections::HashMap::<&str, usize>::new();
+        for line in &self.lines {
+            *counts.entry(line).or_default() += 1;
+        }
+        if counts.len() > 12 {
+            return false;
+        }
+        let (mut repeated, mut kinds) = (0, 0);
+        for (line, count) in counts {
+            let line = line.to_ascii_lowercase();
+            if count >= 2 && ["let me ", "i'll ", "i will ", "making ", "writing ", "reading "]
+                .iter().any(|prefix| line.starts_with(prefix))
+            {
+                repeated += count;
+                kinds += 1;
+            }
+        }
+        kinds >= 2 && repeated >= 8
+    }
+}
+
 impl Default for LoopGuard {
     fn default() -> Self {
         LoopGuard {
@@ -196,5 +261,42 @@ mod tests {
         assert_eq!(g.check(&[1, 2, 3], &prose), None);
         // a stall that has not run long enough yet
         assert_eq!(g.check(&[1, 2, 3], "OK.\nWriting.\nOK.\nWriting.\n"), None);
+    }
+
+    #[test]
+    fn reasoning_intentions_across_chunks() {
+        let cycle = ["Let me read the docs.", "OK.", "Let me write the calls.",
+            "Making calls.", "Let me go.", "Writing now."];
+        let text = (0..24).map(|i| format!("{}\n\n", cycle[i % cycle.len()])).collect::<String>();
+        let mut g = ReasoningStall::default();
+        for c in text.chars().take(text.chars().count() - 2) {
+            assert!(!g.push(&c.to_string()));
+        }
+        assert!(g.push("\n"));
+        assert!(!ReasoningStall::default().push(&text.replace('\n', " ")));
+    }
+
+    #[test]
+    fn reasoning_intentions_match_reported_transcript() {
+        let text = "Making calls.\nLet me write.\nOK.\nLet me just do it.\nReading docs.\n\
+                    Let me write the calls.\nOK.\nLet me write.\nI'll read the two docs.\n\
+                    Let me go.\nWriting.\nOK.\nLet me make the calls.\nWriting now.\n\
+                    Let me go.\nOK.\nLet me write the calls.\nReading docs.\nLet me go.\n\
+                    OK writing.\nLet me make the calls.\nWriting.\nOK.\nLet me write.";
+        let mut g = ReasoningStall::default();
+        assert!(!g.push(text));
+        assert!(g.push("\n"));
+    }
+
+    #[test]
+    fn reasoning_intentions_are_conservative() {
+        let mut g = ReasoningStall::default();
+        assert!(!g.push(&"OK.\nWriting.\n".repeat(12)));
+        assert!(!ReasoningStall::default().push(&(0..24).map(|i| format!("Let me inspect item {i}.\n")).collect::<String>()));
+        assert!(!ReasoningStall::default().push(&"    return value;\n}\n".repeat(12)));
+        let oversized = format!("{}\n", "x".repeat(513));
+        let mut g = ReasoningStall::default();
+        assert!(!g.push(&format!("{}{}{}", "Let me read.\nI'll write.\n".repeat(6), oversized,
+            "Let me read.\nI'll write.\n".repeat(6))));
     }
 }
