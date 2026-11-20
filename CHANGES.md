@@ -120,6 +120,22 @@ Measured and not built:
 
 The chat target of 100 tok/s on the 320 held prompts was not reached: 90.3.
 
+## A tool call the reference reads is no longer answered with a 500 (2026-11-20)
+
+Two divergences between `StreamParser` (what `dsfront serve` streams) and the strict reference parser
+(`parse_message_from_completion_text`, the port of `encoding.py`) made a reply the reference reads come back as
+`malformed model output protocol: ...` with HTTP 500. A client retries a 500, so the symptom is a loop after a
+tool call that never reaches the tool.
+
+| # | Change | Files | Default | Same output | Before -> after |
+|---|---|---|---|---|---|
+| 18 | A `string="false"` value the model wrote as a bare word (`pwd`, `True`, `3 `) is passed through as written, as `encoding.py`'s `parse_tool_calls` does; the streamer no longer validates it as JSON and quarantines the reply | `frontend/src/encoding.rs` | on | yes: the reference's own reading | a reply the reference reads -> HTTP 500 `invalid JSON tool parameter`; now the call reaches the client |
+| 19 | `VALUE_STOPS` covers both tag spellings, so `--stream-tool-args` no longer streams `</｜DSML｜parameter` into a value's pieces when the model writes the no-space spelling | `frontend/src/encoding.rs` | on | yes | streamed arguments `{"path": "a.txt</｜DSML｜paramete"` (not JSON) -> `{"path": "a.txt"` |
+
+`frontend/tests/dsml_reference_agreement.rs` pins the one-way contract: wherever the reference reads a reply, the
+streamer reads it the same way, at every chunk width and in both tool-call modes. The other direction (the reference
+raises, the streamer still finds a call) is by design.
+
 ## Batched outputs bit-identical again at 9..16 rows (2026-11-16; pull request #19 by grisetio)
 
 Since change 4 (6f6392e) a session decoded in a batch of 9..16 rows came out other than alone: plain batches of

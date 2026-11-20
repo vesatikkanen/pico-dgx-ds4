@@ -1167,8 +1167,16 @@ const DSML_OPEN: &str = "<｜DSML｜";
 const DSML_CLOSE: &str = "</｜DSML｜";
 
 /// What a value cannot run into: the parameter's end, and that end with the '<' (and the newline it
-/// may precede) that match_param takes as the value's end.
-const VALUE_STOPS: [&str; 3] = ["/｜DSML｜ parameter", "</｜DSML｜ parameter", "<\n/｜DSML｜ parameter"];
+/// may precede) that match_param takes as the value's end. Both tag spellings, since Phase::Param
+/// accepts either and a value must not stream the one it ends at.
+const VALUE_STOPS: [&str; 6] = [
+    "/｜DSML｜ parameter",
+    "</｜DSML｜ parameter",
+    "<\n/｜DSML｜ parameter",
+    "/｜DSML｜parameter",
+    "</｜DSML｜parameter",
+    "<\n/｜DSML｜parameter",
+];
 
 /// Incremental output protocol decoder. Markers are recognized at any position, including
 /// across UTF-8/token/chunk boundaries. Malformed protocol is never downgraded to API text.
@@ -1440,7 +1448,9 @@ impl StreamParser {
                     let Some((name,flag,value)) = match_param(&segment) else { self.fail("invalid tool parameter"); return };
                     if self.args.iter().any(|(n,_,_)| n==&name) { self.fail("duplicate tool parameter"); return }
                     let value=clean_protocol(&value);
-                    if flag=="false" && serde_json::from_str::<Value>(&value).is_err() { self.fail("invalid JSON tool parameter"); return }
+                    // The reference parser passes a `string="false"` value through as written, JSON or
+                    // not (encoding.py's parse_tool_calls does not validate it). Quarantining it here
+                    // would answer a reply the reference reads with a 500, and a client retries that.
                     if self.stream_args {
                         // clean_protocol can shorten the value below what has already gone out
                         if let Some(n) = self.value_sent { self.value_sent = Some(n.min(value.len())) }
@@ -1736,12 +1746,24 @@ mod tests {
     }
     #[test]
     fn wire_corruption_fails_closed() {
-        for text in [WIRE_CALL.replace("parameter name", "hicles name"), WIRE_CALL.replace("string=\"true\"", "string=\"false\""), WIRE_CALL.replace("</｜DSML｜ parameter>", "") ] {
+        for text in [WIRE_CALL.replace("parameter name", "hicles name"), WIRE_CALL.replace("</｜DSML｜ parameter>", "") ] {
             for w in 1..=text.chars().count() { let (_,_,calls,e)=wire_run(&text,w,true);assert!(calls.is_empty());assert!(e.is_some()); }
         }
     }
     #[test]
     fn wire_no_tools_never_passes_protocol() { let (_,_,calls,e)=wire_run(WIRE_CALL,1,false);assert!(calls.is_empty());assert!(e.is_some()); }
+
+    /// A `string="false"` value the model wrote as a bare word: the reference parser passes it through
+    /// as written (encoding.py does not validate it), so the streamer must not quarantine the reply.
+    #[test]
+    fn wire_bare_non_json_value_is_passed_through() {
+        let text = WIRE_CALL.replace("string=\"true\">pwd<", "string=\"false\">pwd<");
+        for w in 1..=text.chars().count() {
+            let (_,_,calls,e)=wire_run(&text,w,true);
+            assert!(e.is_none(), "{w} at a time: {e:?}");
+            assert_eq!(calls, vec![("exec_command".into(), "{\"cmd\": pwd}".into())], "{w} at a time");
+        }
+    }
     #[test]
     fn wire_plain_text_identity() {
         for text in ["hello\n\n", "x < 5", "x <", "こんにちは\n", "compact JSON: {\"a\":1}"] { for w in 1..=text.chars().count() { let (_,c,_,e)=wire_run(text,w,false);assert_eq!(c,text);assert!(e.is_none()); } }
