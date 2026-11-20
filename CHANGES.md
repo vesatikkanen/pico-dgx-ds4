@@ -154,6 +154,21 @@ leaves its reasoning. It writes short lines from four phrases in no fixed order 
 The two parser fixes above are real but are not this bug: a reply that never carries a tool call cannot be a
 tool-call parsing error.
 
+## A request that names no sampling parameter gets the family's sampler (2026-11-20)
+
+The same checkpoint served by two engines behaves differently: one emits the tool call, the other stalls in its
+reasoning. The prompt is not the difference — `dsfront enccheck` is byte-exact against `encoding.py`, and the
+assistant turn's call and the tool result round-trip through `render_tool_calls` / `merge_tool_messages` exactly as
+the reference writes them. The sampler is.
+
+`top_k` had no server default: a request that named neither `top_p` nor `top_k` got `top_k = 0`, the nucleus alone
+over all 128k logits. That is not the family's sampler. The model card's recommended sampling is temperature 1.0,
+top_p 1.0, top_k 20, and the kit's own serve takes a top-k (20) for exactly this reason.
+
+| # | Change | Files | Default | Same output | Before -> after |
+|---|---|---|---|---|---|
+| 21 | `--top-k K` (20) is the default for a request that names none; a request's own `top_k` still wins, and `0` turns it off | `frontend/src/{main.rs,server.rs}` | on | no: this changes sampling, which is the point. Greedy (`temperature` 0) is untouched, and a request that sends `top_k` is untouched | `top_k = 0` (nucleus only, whole vocabulary) -> `top_k = 20` |
+
 ## Batched outputs bit-identical again at 9..16 rows (2026-11-16; pull request #19 by grisetio)
 
 Since change 4 (6f6392e) a session decoded in a batch of 9..16 rows came out other than alone: plain batches of

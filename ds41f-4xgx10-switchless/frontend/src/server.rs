@@ -40,6 +40,11 @@ pub struct ServerConfig {
     pub default_thinking: bool,
     pub default_temperature: f32,
     pub default_top_p: f32,
+    /// Default for `top_k` when a request names none. 0 is the nucleus alone, which is not the
+    /// family's sampler: the model card's recommended sampling is temperature 1.0, top_p 1.0, and the
+    /// kit's own serve takes a top-k (20). A client that sends neither top_p nor top_k then samples
+    /// the way the model was tuned, instead of over the whole vocabulary.
+    pub default_top_k: u32,
     pub loop_guard: Option<LoopGuard>,
     pub tokenize_threads: usize,
     /// Write each request, its prompt and its ids here, and at its end the output's ids (debugging and
@@ -621,7 +626,7 @@ pub fn prepare(cfg: &ServerConfig, req: &Value) -> Result<Prepared, String> {
         temperature = 0.0;
         top_p = 1.0;
     }
-    let top_k = fnum("top_k")?.map_or(0, |k| if k > 0.0 { k as u32 } else { 0 });
+    let top_k = fnum("top_k")?.map_or(cfg.default_top_k, |k| if k > 0.0 { k as u32 } else { 0 });
     let seed = r.get("seed").filter(|v| !v.is_null()).map(|v| num_i64(v).map(|s| s as u64).ok_or("seed must be an integer")).transpose()?;
     let stops = match r.get("stop") {
         None | Some(Value::Null) => Vec::new(),
@@ -1278,6 +1283,7 @@ pub(crate) mod tests {
             default_thinking: false,
             default_temperature: 1.0,
             default_top_p: 0.95,
+            default_top_k: 20,
             loop_guard: None,
             tokenize_threads: 1,
             dump_dir: None,
@@ -1399,9 +1405,31 @@ pub(crate) mod tests {
         ServerConfig { default_thinking: true, ..cfg() }
     }
 
+    /// A client that names no sampling parameter gets the family's sampler, not the whole vocabulary:
+    /// the model card's is temperature 1.0, top_p 1.0, top_k 20, and the kit's serve takes a top-k.
+    /// Without one, a request that sends neither top_p nor top_k samples over all 128k logits, which
+    /// is where a model stalls in its reasoning instead of emitting a tool call.
     #[test]
-    fn thinking_is_off_unless_asked() {
-        for encoding in [Encoding::V41, Encoding::V41_1017] {
+    fn sampling_defaults_keep_a_top_k() {
+        let cfg = cfg();
+        assert_eq!(cfg.default_top_k, 20);
+        let p = prepare(&cfg, &request()).unwrap();
+        assert_eq!((p.temperature, p.top_p, p.top_k), (1.0, 0.95, 20));
+        // a request that names one still wins, and 0 turns it off
+        let mut r = request();
+        r["top_k"] = json!(5);
+        assert_eq!(prepare(&cfg, &r).unwrap().top_k, 5);
+        let mut r = request();
+        r["top_k"] = json!(0);
+        assert_eq!(prepare(&cfg, &r).unwrap().top_k, 0);
+        // greedy ignores it
+        let mut r = request();
+        r["temperature"] = json!(0);
+        assert_eq!(prepare(&cfg, &r).unwrap().temperature, 0.0);
+    }
+
+    #[test]
+    fn thinking_is_off_unless_asked() {        for encoding in [Encoding::V41, Encoding::V41_1017] {
             // the server default: a request with no thinking field is answered in chat mode
             let cfg = ServerConfig { encoding, ..cfg() };
             let p = prepare(&cfg, &request()).unwrap();

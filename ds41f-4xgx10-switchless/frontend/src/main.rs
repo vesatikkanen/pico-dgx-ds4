@@ -22,6 +22,8 @@ fn usage() -> ! {
       --no-thinking             thinking off when a request does not say (the default; the later
                                 of --thinking and --no-thinking wins); requests can override it
       --temperature T --top-p P sampling defaults: 1.0 and 0.95
+      --top-k K                  sampling default for top_k: 20 (0 = the nucleus alone, which is not
+                                the family's sampler; the model card's is T 1.0, top_p 1.0, top_k 20)
       --no-loop-guard           do not stop repetition loops
       --stream-tool-args        a stream's tool calls in pieces, as OpenAI streams them: the call's name
                                 when it has parsed, then its arguments as they arrive (default: each
@@ -133,6 +135,7 @@ fn serve(args: &[String]) {
         default_thinking: default_thinking(args),
         default_temperature: parse_opt(args, "--temperature", 1.0f32),
         default_top_p: parse_opt(args, "--top-p", 0.95f32),
+        default_top_k: parse_opt(args, "--top-k", 20u32),
         loop_guard: if args.iter().any(|a| a == "--no-loop-guard") { None } else { Some(Default::default()) },
         tokenize_threads: parse_opt(args, "--tokenize-threads", 8usize).max(1),
         dump_dir: opt(args, "--dump-dir").map(Into::into)
