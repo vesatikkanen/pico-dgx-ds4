@@ -57,13 +57,29 @@ pub struct LoopGuard {
     pub identical: usize,
     pub line_repeats: usize,
     pub line_min: usize,
+    /// A run of this many non-empty lines, each shorter than `line_min` and drawn from at most
+    /// `short_distinct` different texts, is a loop too. A model that stalls in its reasoning writes
+    /// short lines from a handful of phrases ("OK.", "Let me write.", "Writing.", "Go.") in no fixed
+    /// order, so neither the n-gram rule (no exact period) nor the line rule (every line is below
+    /// `line_min`) sees it, and it runs to `max_tokens` without ever reaching a tool call.
+    pub short_lines: usize,
+    pub short_distinct: usize,
 }
 
 pub const LINE_WINDOW_TOKENS: usize = 512;
 
 impl Default for LoopGuard {
     fn default() -> Self {
-        LoopGuard { ngram: 32, ngram_max: 256, repeats: 4, identical: 64, line_repeats: 8, line_min: 16 }
+        LoopGuard {
+            ngram: 32,
+            ngram_max: 256,
+            repeats: 4,
+            identical: 64,
+            line_repeats: 8,
+            line_min: 16,
+            short_lines: 24,
+            short_distinct: 6,
+        }
     }
 }
 
@@ -110,6 +126,24 @@ impl LoopGuard {
                     return Some(n);
                 }
             }
+            // The same stall with no fixed order and no line long enough for the rule above.
+            if self.short_lines > 0 && self.short_distinct > 0 && lines.len() >= self.short_lines {
+                let run = &lines[lines.len() - self.short_lines..];
+                if run.iter().all(|l| l.chars().count() < self.line_min) {
+                    let mut seen: Vec<&str> = Vec::new();
+                    for l in run {
+                        if !seen.contains(l) {
+                            seen.push(l);
+                            if seen.len() > self.short_distinct {
+                                break;
+                            }
+                        }
+                    }
+                    if seen.len() <= self.short_distinct {
+                        return Some(n);
+                    }
+                }
+            }
         }
         None
     }
@@ -143,5 +177,24 @@ mod tests {
         let text = "line that repeats itself\n".repeat(8);
         assert_eq!(g.check(&[1, 2, 3], &text), Some(3));
         assert_eq!(g.check(&[1, 2, 3], &"short\n".repeat(8)), None);
+    }
+
+    /// A stall in reasoning: short lines from a handful of phrases, in no fixed order, so neither
+    /// the n-gram rule (no exact period) nor the line rule (no line reaches line_min) fires.
+    #[test]
+    fn short_line_stall() {
+        let g = LoopGuard::default();
+        let stall = "OK.\nLet me write.\nWriting.\nGo.\nOK.\nLet me write.\nWriting.\nLet me write.\nOK.\nWriting.\n\
+                     Let me write.\nGo.\nWriting.\nOK.\nLet me write.\nWriting.\nGo.\nOK.\nLet me write.\nWriting.\n\
+                     Let me write.\nOK.\nWriting.\nLet me write.\nGo.\nWriting.\nOK.\nLet me write.\nWriting.\n";
+        assert_eq!(g.check(&[1, 2, 3], stall), Some(3));
+        // the same lines, but each long enough for the line rule to have its own say
+        let long = "a line that is long enough\n".repeat(24);
+        assert_eq!(g.check(&[1, 2, 3], &long), Some(3));
+        // prose of short lines is not a stall: too many different ones
+        let prose = (0..24).map(|i| format!("line {i}\n")).collect::<String>();
+        assert_eq!(g.check(&[1, 2, 3], &prose), None);
+        // a stall that has not run long enough yet
+        assert_eq!(g.check(&[1, 2, 3], "OK.\nWriting.\nOK.\nWriting.\n"), None);
     }
 }

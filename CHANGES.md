@@ -136,6 +136,24 @@ tool call that never reaches the tool.
 streamer reads it the same way, at every chunk width and in both tool-call modes. The other direction (the reference
 raises, the streamer still finds a call) is by design.
 
+## A stall in reasoning is stopped, not run to `max_tokens` (2026-11-20)
+
+An agentic client reported a loop after a tool call that never came. The transcript shows why: the model never
+leaves its reasoning. It writes short lines from four phrases in no fixed order — `OK.`, `Let me write.`,
+`Writing.`, `Go.` — for the rest of the budget, so no tool call is ever emitted. `LoopGuard` saw none of it:
+
+- the n-gram rule needs `repeats` (4) identical consecutive n-grams of `ngram` (32) or more tokens, and the stall
+  has no exact period;
+- the line rule needs `line_repeats` (8) identical lines of at least `line_min` (16) characters, and every line of
+  the stall is 3 to 13 characters.
+
+| # | Change | Files | Default | Same output | Before -> after |
+|---|---|---|---|---|---|
+| 20 | `LoopGuard` stops a run of `short_lines` (24) non-empty lines, each shorter than `line_min` and drawn from at most `short_distinct` (6) different texts | `frontend/src/guard.rs` | on | yes: a guard that fires only on a stall, and prose of short lines has too many different ones | the stall above ran to `max_tokens` with no tool call -> the request ends at the stall |
+
+The two parser fixes above are real but are not this bug: a reply that never carries a tool call cannot be a
+tool-call parsing error.
+
 ## Batched outputs bit-identical again at 9..16 rows (2026-11-16; pull request #19 by grisetio)
 
 Since change 4 (6f6392e) a session decoded in a batch of 9..16 rows came out other than alone: plain batches of
