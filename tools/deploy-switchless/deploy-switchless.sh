@@ -17,7 +17,7 @@
 #   ./deploy-switchless.sh redeploy --pr 2      # ... from a pull request's head (merged with main)
 #   ./deploy-switchless.sh redeploy --ref <sha> # ... from any commit, branch or tag
 #   ./deploy-switchless.sh redeploy --repo URL --ref <branch>  # ... from a fork's branch
-#   ./deploy-switchless.sh redeploy --fork      # ... from the branch with PRs #2, #3, #7, #15, #19 and /metrics
+#   ./deploy-switchless.sh redeploy --fork      # ... from the newest branch with every fix (FORK_REF)
 #   ./deploy-switchless.sh redeploy --fork --no-stream-args  # ... without PR #7
 #   ./deploy-switchless.sh redeploy --no-vision  # ... without the image encoder (text only)
 #   ./deploy-switchless.sh --phase checkpoint   # one phase (repeatable; runs even if it finished before)
@@ -92,14 +92,17 @@ FORK_URL=https://github.com/vesatikkanen/pico-dgx-ds4.git
 # What a plain run deploys: the repository the script is in, at REPO_REF (main). That is what a reader
 # of the repo expects, and it is what this script ships as.
 #
-# --fork deploys FORK_REF from FORK_URL instead: the branch that carries every fix the ring needs, all
-# four pull requests on main — PR #3 (sampler open-interval endpoint, @ofan), PR #2 (DSML quarantine,
-# @ofan), PR #7 (a stream's tool calls in pieces, @mpfaffenberger) and PR #15 (the service owns the
-# image encoder, @mpfaffenberger) — plus this fork's own work on top: the vision encoder as part of the
-# service, the `/metrics` endpoint sparkDash reads, and PR #19's batch-norm fix (@grisetio). Their
-# authors' work, not this script's. STREAM_TOOL_ARGS and VISION are on with it. `--fork --no-stream-args`
-# deploys BASE_REF instead (PRs #2, #3 and #15, without #7); `--no-vision` leaves the encoder out.
-FORK_REF=${FORK_REF:-fix/sampler-dsml-stream-args-vision-metrics}
+# --fork deploys FORK_REF from FORK_URL instead: the newest branch that carries every fix the ring
+# needs, all four pull requests on main — PR #3 (sampler open-interval endpoint, @ofan), PR #2 (DSML
+# quarantine, @ofan), PR #7 (a stream's tool calls in pieces, @mpfaffenberger) and PR #15 (the service
+# owns the image encoder, @mpfaffenberger) — plus this fork's own work on top: the vision encoder as
+# part of the service, the `/metrics` endpoint sparkDash reads, PR #19's batch-norm fix (@grisetio),
+# and the tool-call loop fixes (a `string="false"` value passed through as the reference does, both
+# tag spellings held back when streaming arguments, a short-line reasoning stall stopped, and the
+# family's top-k as the sampling default). Their authors' work, not this script's. STREAM_TOOL_ARGS
+# and VISION are on with it. `--fork --no-stream-args` deploys BASE_REF instead (PRs #2, #3 and #15,
+# without #7); `--no-vision` leaves the encoder out.
+FORK_REF=${FORK_REF:-fix/tool-call-loop}
 BASE_REF=${BASE_REF:-fix/sampler-and-dsml}
 FORK=${FORK:-0}                                      # 1: deploy FORK_REF from FORK_URL (--fork)
 REPO_URL=${REPO_URL:-$UPSTREAM_URL}                  # the clone's origin
@@ -672,11 +675,14 @@ netplan_write() {  # rank... -- netdev... -- ip...
 # By default this script deploys the repository it is in, at whatever that clone has checked out (or
 # REPO_REF, main, when it cloned the recipe itself).
 #
-# --fork deploys FORK_REF (fix/sampler-dsml-stream-args-vision-metrics) from FORK_URL instead: that
+# --fork deploys FORK_REF (fix/tool-call-loop) from FORK_URL instead: that
 # branch carries every fix the ring needs, all four pull requests (PR #3's sampler endpoint and PR #2's
 # DSML quarantine, both @ofan's; PR #7's streamed tool calls and PR #15's encoder in the service, both
 # @mpfaffenberger's), plus this fork's own work on top: the vision encoder in the service, the
-# `/metrics` endpoint sparkDash reads, and PR #19's batch-norm fix (@grisetio).
+# `/metrics` endpoint sparkDash reads, PR #19's batch-norm fix (@grisetio), and the tool-call loop
+# fixes (a `string="false"` value passed through as the reference does, both tag spellings held back
+# when streaming arguments, a short-line reasoning stall stopped, and the family's top-k as the
+# sampling default).
 #   ./deploy-switchless.sh redeploy --fork
 #
 # --fork --no-stream-args deploys BASE_REF (fix/sampler-and-dsml) instead: PRs #2, #3 and #15, without
@@ -1517,7 +1523,7 @@ instructions() {
   printf '  ./deploy-switchless.sh logs       the last lines of its logs\n'
   printf '  ./deploy-switchless.sh crash      why the engine last died: exit code, its last words, OOM\n'
   printf '  ./deploy-switchless.sh redeploy   a new version of the recipe: fetch, rebuild, restart\n'
-  printf '  ./deploy-switchless.sh redeploy --fork   the branch with PRs #2, #3, #7, #15, #19 and /metrics\n'
+  printf '  ./deploy-switchless.sh redeploy --fork   the newest branch with every fix (FORK_REF)\n'
   printf '  ./deploy-switchless.sh redeploy --fork --no-stream-args   ... without PR #7\n'
   printf '  ./deploy-switchless.sh redeploy --no-vision        ... without the image encoder\n'
   printf '\n'
