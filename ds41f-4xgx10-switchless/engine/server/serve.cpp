@@ -57,6 +57,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <climits>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -401,6 +402,7 @@ struct Session {
   std::vector<fe::ImageSpan> image_spans;
   std::vector<uint16_t> image_rows;
   double image_used = 0;
+  bool ordinary_text = false;  // kept-session indexes do not record lineage
 };
 
 // WARM: DSGB10_REUSE_EXACT=L (default 0: as before).
@@ -1072,6 +1074,144 @@ class Server {
     return best;
   }
 
+  static bool ordinary_text_alternates_enabled() {
+    static const bool enabled = [] {
+      const char* opt_in = std::getenv("DSGB10_ORDINARY_TEXT_ALTERNATES");
+      return opt_in && std::strcmp(opt_in, "1") == 0;
+    }();
+    return enabled;
+  }
+
+  static bool ordinary_text_spilled_alternates_enabled() {
+    static const bool enabled = [] {
+      const char* opt_in = std::getenv("DSGB10_ORDINARY_TEXT_SPILLED_ALTERNATES");
+      return opt_in && std::strcmp(opt_in, "1") == 0;
+    }();
+    return enabled;
+  }
+
+  static bool ordinary_text_lineage(bool image_request, const Session* source) {
+    return !image_request && (!source || source->ordinary_text);
+  }
+
+  static bool ordinary_existing_text_alternates_enabled() {
+    static const bool enabled = [] {
+      const char* opt_in = std::getenv("DSGB10_ORDINARY_EXISTING_TEXT_ALTERNATES");
+      return opt_in && std::strcmp(opt_in, "1") == 0;
+    }();
+    return enabled;
+  }
+
+  struct TextChoice {
+    uint64_t id = 0;
+    int common = 0, slot = -1;
+    Plan restart;
+  };
+
+  // Alternate sources are resident, idle text sessions from this connection.
+  // Planned-stop restores lack proven text lineage, even when explicitly resumed.
+  TextChoice text_alternate(const ConnP& conn, uint64_t named, const std::vector<int32_t>& prompt,
+                            int need, const std::set<uint64_t>& keep, int floor, bool stored_only = false) const {
+    TextChoice best;
+    const int n = (int)prompt.size();
+    constexpr size_t kMaxSessions = 256;
+    constexpr size_t kPrefixBudget = 4 * 1024 * 1024;
+    if (conn->dead || floor >= n - 1 || sess_.size() > kMaxSessions) return best;
+    size_t remaining = kPrefixBudget;
+    std::tuple<int, bool, uint64_t, uint64_t> best_key{};
+    for (const auto& [id, candidate] : sess_) {
+      if (id == named || !candidate.ordinary_text || (stored_only && candidate.slot >= 0) ||
+          flying_.count(id) || candidate.text_owner.lock() != conn ||
+          candidate.hist.size() <= static_cast<size_t>(floor)) continue;
+      const auto info = m_.state_info(candidate.h);
+      if (info.on_disk) continue;
+      const size_t limit = std::min(candidate.hist.size(), static_cast<size_t>(n - 1));
+      // Charge the full span so the fallback does not depend on iteration order.
+      if (limit > remaining) return TextChoice{};
+      remaining -= limit;
+      const auto mismatch = std::mismatch(candidate.hist.begin(), candidate.hist.begin() + limit, prompt.begin());
+      const int common = static_cast<int>(mismatch.first - candidate.hist.begin());
+      if (common <= floor) continue;
+      const bool live = candidate.slot >= 0 && slot_[candidate.slot] == id && !keep.count(id) &&
+                        fits(candidate.slot, need);
+      const Plan restart = choose(candidate, live, common, n);
+      if (restart.q <= floor) continue;
+      // Taking this live slot persists its current end before the restore.
+      if (live && restart.how == kEnd && info.end_pos != static_cast<int>(candidate.hist.size())) continue;
+      const auto key = std::make_tuple(restart.q, live, candidate.used, UINT64_MAX - id);
+      if (key <= best_key) continue;
+      best_key = key;
+      best = TextChoice{id, common, live ? candidate.slot : -1, restart};
+    }
+    return best;
+  }
+
+  // Cheap disk metadata and exact submitted tokens only. A staged snapshot
+  // must have saved pages through its position and leave any required replay.
+  TextChoice text_spilled_alternate(const ConnP& conn, uint64_t named,
+                                    const std::vector<int32_t>& prompt, int floor) const {
+    constexpr int kMinDiskGain = 8192;
+    constexpr size_t kMaxSessions = 256;
+    constexpr size_t kPrefixBudget = 4 * 1024 * 1024;
+    TextChoice best;
+    const int n = (int)prompt.size();
+    if (conn->dead || n - 1 - floor < kMinDiskGain || sess_.size() > kMaxSessions) return best;
+    const int minimum = floor + kMinDiskGain;
+    size_t remaining = kPrefixBudget;
+    std::tuple<int, uint64_t, uint64_t> best_key{};
+    for (const auto& [id, candidate] : sess_) {
+      if (id == named || !candidate.ordinary_text || candidate.slot >= 0 || flying_.count(id) ||
+          candidate.text_owner.lock() != conn || candidate.hist.size() < static_cast<size_t>(minimum)) continue;
+      const auto info = m_.state_info(candidate.h);
+      if (!info.on_disk || info.saved < minimum || info.snaps.empty()) continue;
+      const size_t limit = std::min({candidate.hist.size(), static_cast<size_t>(n - 1),
+                                     static_cast<size_t>(info.saved)});
+      if (limit > remaining) return TextChoice{};
+      remaining -= limit;
+      const auto mismatch = std::mismatch(candidate.hist.begin(), candidate.hist.begin() + limit, prompt.begin());
+      const int common = static_cast<int>(mismatch.first - candidate.hist.begin());
+      if (common < minimum) continue;
+      for (const int snap : info.snaps) {
+        const int q = snap & ~1;
+        if (q < minimum || q > common) continue;
+        const bool encoder_only = std::find(candidate.enc_snaps.begin(), candidate.enc_snaps.end(), snap) !=
+                                  candidate.enc_snaps.end();
+        if (encoder_only && (!o_.ced || n - q < kReplay)) continue;
+        const auto key = std::make_tuple(q, candidate.used, UINT64_MAX - id);
+        if (key <= best_key) continue;
+        best_key = key;
+        best = TextChoice{id, common, -1, Plan{q, kSnap, snap}};
+      }
+    }
+    return best;
+  }
+
+  bool text_spilled_alternate_ready(const Session& source, const TextChoice& hit, int staged) {
+    Cmd c{};
+    c.op = kCmdStageTextCheckpoint;
+    c.handle = source.h;
+    c.next = staged;
+    c.pos0 = hit.restart.snap;
+    issue(c);
+    return stage_text_checkpoint(m_, ring_, c);
+  }
+
+  // Validate only the winner. A stale or rank-local stored checkpoint leaves
+  // the original plan intact and incurs at most one extra command round trip.
+  bool text_alternate_ready(const Session& source, const TextChoice& hit) {
+    const Plan& plan = hit.restart;
+    if (plan.how == kLive) return true;
+    Cmd c{};
+    c.op = kCmdTextCheckpoint;
+    c.handle = source.h;
+    c.pos0 = plan.q;
+    c.next = plan.how == kSnap ? plan.snap : -1;
+    c.rows = plan.how == kEnd ? m_.state_info(source.h).end_pos : -1;
+    c.n = hit.slot < 0 ? 1 : 0;  // a live slot needs its rings, but already has its compressed pages
+    issue(c);
+    return text_checkpoint_ready(m_, ring_, c);
+  }
+
   void tokens(const Request& rq, const model::SampleOut& o, int row) {
     const bool lp = rq.h.flags & fe::kFlagLogprobs;
     const int nt = lp ? std::min<int>({(int)rq.h.n_top_logprobs, model::ops::kTopLogprobs, o.n_top}) : 0;
@@ -1229,6 +1369,9 @@ class Server {
     if (!S && h.base_session_id) src = find(h.base_session_id), src_id = h.base_session_id;
     const int need = need_clamped(f.rq);
     const bool image_request = !resume && !f.rq.spans.empty();
+    // Lineage is about what the request carries, not about whether this run resumes.
+    const bool image_lineage = (h.flags & fe::kFlagImages) || !f.rq.spans.empty() || !f.rq.img.empty();
+    const bool ordinary_text = ordinary_text_lineage(image_lineage, src);
     int p = 0;
     int s = S ? S->slot : -1;
     Plan pl;
@@ -1302,7 +1445,7 @@ class Server {
     }
     if (s < 0) s = pick_slot(keep, need);
     if (s < 0) die("serve: no slot for request %llu", (unsigned long long)h.req_id);  // admit() saw one
-    const bool src_live = src && src->slot == s;
+    bool src_live = src && src->slot == s;
     if (src) p = std::min(lcp(src->hist, prompt), n - 1);
     const bool kept_text = (h.flags & fe::kFlagKeep) && !(h.flags & fe::kFlagImages);
     // An optional window can help another branch on the same frontend connection.
@@ -1313,6 +1456,51 @@ class Server {
       if (mark != src->pe_snap && !keep_snap(mark, (int)src->hist.size(), o_.snap_every)) skip_snap = mark;
     }
     if (!image_request && src) pl = choose(*src, src_live, p, n, false, skip_snap);
+    constexpr int kMinExistingGain = 8192;
+    const bool same_chat_lookup = !resume && ordinary_text && S && !h.base_session_id && (h.flags & fe::kFlagKeep) &&
+        S->text_owner.lock() == f.rq.conn && !f.rq.conn->dead && n - 1 - pl.q >= kMinExistingGain &&
+        next_h_ < INT_MAX - 1 && ordinary_existing_text_alternates_enabled();
+    const bool text_fork = !resume && ordinary_text && !S && h.base_session_id;
+    if ((text_fork || same_chat_lookup) && pl.q < n - 1 && ordinary_text_alternates_enabled()) {
+      const int floor = same_chat_lookup ? pl.q + kMinExistingGain - 1 : pl.q;
+      const TextChoice hit = text_alternate(f.rq.conn, src_id, prompt, need, keep, floor, same_chat_lookup);
+      if (hit.id) {
+        Session* alt = find(hit.id);
+        if (alt && text_alternate_ready(*alt, hit)) {
+          src = alt;
+          src_id = hit.id;
+          p = hit.common;
+          pl = hit.restart;
+          src_live = hit.slot >= 0;
+          if (src_live) s = hit.slot;
+        }
+      }
+    }
+    int spilled_source_h = 0;
+    if ((text_fork || same_chat_lookup) && (h.flags & fe::kFlagKeep) &&
+        ordinary_text_spilled_alternates_enabled() && next_h_ < INT_MAX - 1) {
+      const TextChoice hit = text_spilled_alternate(f.rq.conn, S ? h.session_id : h.base_session_id, prompt, pl.q);
+      if (hit.id) {
+        const Session* alt = find(hit.id);
+        if (alt) {
+          const int staged = next_h_++;
+          if (text_spilled_alternate_ready(*alt, hit, staged)) {
+            // No state command may intervene before kCmdTokens. Its load and
+            // restore operations pin this handle through slot displacement.
+            disk_source.h = staged;
+            spilled_source_h = alt->h;
+            if (std::find(alt->enc_snaps.begin(), alt->enc_snaps.end(), hit.restart.snap) != alt->enc_snaps.end())
+              disk_source.enc_snaps.push_back(hit.restart.snap);
+            src = &disk_source;
+            src_id = hit.id;
+            p = hit.common;
+            pl = hit.restart;
+            src_live = false;
+          }
+        }
+      }
+    }
+    const bool replace_destination = same_chat_lookup && src != S;
     const int q = pl.q;
     const int lvl = reuse_exact();
     const int src_pf = src ? src->pf : 0;  // WARM: the source's prefill frontier (S may be src: read it now)
@@ -1333,9 +1521,14 @@ class Server {
         else
           std::snprintf(from, sizeof from, "no base named, and this engine does not hold the session");
       } else {
-        const int k = S ? std::snprintf(from, sizeof from, "its own history: common prefix %d ids", p)
-                        : std::snprintf(from, sizeof from, "a fork of %016llx: common prefix %d ids",
-                                        (unsigned long long)src_id, p);
+        int k;
+        if (replace_destination)
+          k = std::snprintf(from, sizeof from, "a stored same-connection checkpoint: common prefix %d ids", p);
+        else if (S)
+          k = std::snprintf(from, sizeof from, "its own history: common prefix %d ids", p);
+        else
+          k = std::snprintf(from, sizeof from, "a fork of %016llx: common prefix %d ids",
+                            (unsigned long long)src_id, p);
         if (pl.how == kCold && k > 0 && k < (int)sizeof from) {
           const int r = first_restart(*src, skip_snap);
           if (r < 0) std::snprintf(from + k, sizeof from - k, ", and it has no restart point");
@@ -1352,6 +1545,14 @@ class Server {
         y->slot = -1;
       }
       slot_[s] = 0;
+    }
+    // Keep the session ID and slot. Its previous answer can own pages past
+    // this edit, so copy the validated source into a fresh store handle.
+    int retired_handle = 0;
+    if (replace_destination) {
+      retired_handle = S->h;
+      *S = Session{};
+      S->h = next_h_++;
     }
     if (!S) {
       Session ns;
@@ -1377,6 +1578,7 @@ class Server {
       else v.push_back({kStDrop, S->h, q, 0});                     // S forgets what follows q
       if (skip_snap >= 0 && skip_snap <= q) v.push_back({kStDropSnap, S->h, skip_snap, 0});
     }
+    if (retired_handle) v.push_back({kStFree, retired_handle, 0, 0});
     // the new live state's exact ranges
     if (pl.how == kCold) S->lo = S->clo = S->w = 0;
     else if (pl.how == kSnap) S->lo = pl.snap - 128, S->clo = q, S->w = q;
@@ -1384,6 +1586,12 @@ class Server {
     else S->lo = src->lo, S->clo = src->clo, S->w = src->w;
     slot_[s] = h.session_id;
     S->slot = s;
+    if (!resume) {
+      S->ordinary_text = ordinary_text;
+      if (ordinary_text && (ordinary_text_alternates_enabled() ||
+          ((h.flags & fe::kFlagKeep) && ordinary_text_spilled_alternates_enabled()))) S->text_owner = f.rq.conn;
+      else S->text_owner.reset();
+    }
     S->used = ++clock_;
     S->t_used = unix_now();
     S->hist.assign(prompt.begin(), prompt.begin() + q);
@@ -1431,6 +1639,8 @@ class Server {
         c.delta = 1;
         c.hist_hash = copy_hist_hash(hh.data(), L);
       }
+      // Pin the original spill through slot displacement and copying.
+      if (spilled_source_h) c.handle = spilled_source_h;
       c.n = n - c.pos0;
       c.n_pred = copy_on ? (int)f.rq.pred.size() : 0;
       if (v.size() > (size_t)kMaxOps) die("serve: %zu state operations for one command", v.size());

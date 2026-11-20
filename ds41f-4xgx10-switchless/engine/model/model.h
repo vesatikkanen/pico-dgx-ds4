@@ -345,6 +345,9 @@ class Model {
   std::string state_disk_path() const;
   void state_spill(int h);    // session h's state to the disk tier (freed without one: state_evicted)
   void state_unspill(int h, int window_limit = -1, int preferred_snap = -1, bool window_first = false);  // and back; optional deepest useful replay window
+  // Stage an exact spill window in a fresh handle without evicting or consuming the source. The
+  // caller synchronizes the ranks and frees any staged handle after use or a refused vote.
+  bool state_stage_spilled_snapshot(int source, int fresh, int snap);
   struct StateInfo {
     int saved = 0;           // compressed caches of positions [0, saved) are kept
     int end_pos = -1;        // the end snapshot's position (-1: none)

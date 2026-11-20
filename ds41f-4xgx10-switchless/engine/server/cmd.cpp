@@ -1132,6 +1132,10 @@ void follow(model::Model& m, comm::Ring& ring, Watchdog& wd, int rank) {
       (void)run_durable_prune(m, ring, c, rank);
     } else if (c.op == kCmdDurableSave || c.op == kCmdDurableLoad || c.op == kCmdDurableDrop) {
       (void)run_durable(m, ring, c);
+    } else if (c.op == kCmdStageTextCheckpoint) {
+      stage_text_checkpoint(m, ring, c);
+    } else if (c.op == kCmdTextCheckpoint) {
+      text_checkpoint_ready(m, ring, c);
     } else if (c.op != kCmdState) {
       die("rank %d: unknown command %d", rank, c.op);
     }
