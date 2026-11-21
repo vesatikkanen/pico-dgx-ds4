@@ -471,6 +471,7 @@ Every setting is an environment variable, and the ones with a flag have one.
 | `JOBS` | 4 | cmake/cargo parallelism |
 | `KEEP_CHECKPOINT` | 1 | `0` deletes the checkpoint once the weight files are cut |
 | `LOSSLESS` | 0 | `1` drops `DSGB10_OEA` (the lossy expert re-route) |
+| `TUNED` (`--tuned` / `--no-tuned`) | 1 | the recipe's served engine and front-end settings (see below) |
 | `DSGB10_PORT` | 8888 | the front-end's port (`DSGB10_PROD` follows it) |
 | `DSGB10_ADDR` | loopback + this box's LAN address | the front-end's addresses |
 | `STREAM_TOOL_ARGS` | 1 | `--stream-tool-args`: a stream's tool calls in pieces |
@@ -484,6 +485,32 @@ Every setting is an environment variable, and the ones with a flag have one.
 
 Anything that needs sudo or deletes data is opt-in: `INSTALL_DEPS=1`, `NET_APPLY=1`,
 `KEEP_CHECKPOINT=0`.
+
+## The served settings (`TUNED=1`)
+
+The recipe's README has a "run it" block with the engine arguments its throughput figures were measured
+with. `TUNED=1` (the default) is that block, so a deploy is as fast as the recipe can be without
+hand-editing the arguments. Every variable in it leaves the output identical or the same distribution:
+
+| what | variables |
+| --- | --- |
+| wide steps | `DSGB10_WIDE_SH=1`, `DSGB10_WIDE_AR=2`, `DSGB10_HEADG=2`, `DSGB10_GATE_SEP=1` |
+| prefetch and prefill | `DSGB10_L2PF=d:.../c2:...`, `DSGB10_PF_TUNE=hc,small,down` |
+| drafting | `DSGB10_DRAFT_MAX=7`, `DSGB10_DRAFT_DYN=5` |
+| sampling | `DSGB10_GSAMPLE=1`, `DSGB10_GCOUPLE=0.8` |
+| prompt reuse | `DSGB10_REUSE_EXACT=1` |
+| copy drafts | `DSGB10_COPY=1`, `COPY_ROWS=64`, `COPY_ENTER=32`, `COPY_SHARED=0`, `COPY_SW=1`, `COPY_DELTA=1`, `COPY_LOG=1` |
+| copy steps' exact bodies | `DSGB10_EXACT_SOLO=136`, `DSGB10_NORM_EXACT=1`, `DSGB10_WIDE_EXACT=95`, `DSGB10_WIDE_EXACT_MT=2` |
+| front-end | `--prediction`, `--max-image-rows-in-flight 40000` |
+
+Two of the recipe's served variables are **not** set: `DSGB10_RING_DIRECT=2` and
+`DSGB10_RING_RSBAL=1` are for a switch, where every rank reaches every rank in one hop, and this ring
+is switchless. `--no-tuned` (`TUNED=0`) starts the service with the plain arguments instead.
+
+`DSGB10_COPY` is the one that matters most for agent work: a reply that repeats text already in the
+prompt (a file rewrite, an edit, echoed code) or in the client's `prediction` is drafted from that text
+and verified, up to 64 rows a step, instead of generated a token at a time. It needs the front-end's
+`--prediction` to use the client's field, which is why `TUNED=1` adds it.
 
 ## Images
 
@@ -559,6 +586,8 @@ a DGX.
 - It does not configure the links' addresses unless `NET_APPLY=1`. It writes the netplan files, but it
   does not install them: copying each to `/etc/netplan/` on its box is yours to do.
 - It does not install the build dependencies unless `INSTALL_DEPS=1`.
-- It does not tune the ring: the engine arguments are the recipe's, and `LOSSLESS=1` is the only
-  variation it offers.
+- It does not tune the ring: the engine arguments are the recipe's served ones (`TUNED=1`, the default),
+  and `LOSSLESS=1` and `TUNED=0` are the only variations it offers. It leaves out the two served
+  variables that need a switch (`DSGB10_RING_DIRECT=2`, `DSGB10_RING_RSBAL=1`), since this ring is
+  switchless.
 - It does not push anything. A PR's head is merged locally, on a branch named `deploy-<ref>`.

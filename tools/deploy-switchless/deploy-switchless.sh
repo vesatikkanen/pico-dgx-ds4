@@ -20,6 +20,7 @@
 #   ./deploy-switchless.sh redeploy --fork      # ... from the newest branch with every fix (FORK_REF)
 #   ./deploy-switchless.sh redeploy --fork --no-stream-args  # ... without PR #7
 #   ./deploy-switchless.sh redeploy --no-vision  # ... without the image encoder (text only)
+#   ./deploy-switchless.sh redeploy --no-tuned  # ... with the recipe's plain engine arguments
 #   ./deploy-switchless.sh --phase checkpoint   # one phase (repeatable; runs even if it finished before)
 #   ./deploy-switchless.sh --skip checkpoint    # every phase but these
 #   ./deploy-switchless.sh --force --phase build
@@ -66,6 +67,18 @@
 # that is already on disk. VISION_MEM (32g) is the container's memory limit, and on a GB10 the GPU's
 # memory is host memory, so it caps the encoder's GPU memory too: a smaller limit fails in load() with
 # "CUDA error: out of memory".
+#
+# TUNED=1 (the default) starts the engine and the front-end with the recipe's served settings, the ones
+# its README's "run it" block lists: DSGB10_WIDE_SH, DSGB10_WIDE_AR=2, DSGB10_L2PF, DSGB10_PF_TUNE,
+# DSGB10_DRAFT_MAX=7 with DSGB10_DRAFT_DYN=5, DSGB10_REUSE_EXACT=1, DSGB10_HEADG=2, DSGB10_GSAMPLE=1
+# with DSGB10_GCOUPLE=0.8, DSGB10_GATE_SEP=1, the copy drafts (DSGB10_COPY=1 with COPY_ROWS=64,
+# COPY_ENTER=32, COPY_SHARED=0, COPY_SW=1, COPY_DELTA=1, COPY_LOG=1) and their exact solo bodies
+# (DSGB10_EXACT_SOLO=136, DSGB10_NORM_EXACT=1, DSGB10_WIDE_EXACT=95, DSGB10_WIDE_EXACT_MT=2), plus the
+# front-end's --prediction and --max-image-rows-in-flight 40000. Each one leaves the output identical
+# or the same distribution; together they are what the recipe's throughput figures were measured with.
+# Two of its served variables are left out: DSGB10_RING_DIRECT=2 and DSGB10_RING_RSBAL=1 are for a
+# switch, where every rank reaches every rank in one hop, and this ring is switchless. `--no-tuned`
+# (TUNED=0) starts the service with the plain arguments instead.
 #
 # Everything goes under one directory: the clone, the fleet file, the checkpoint, the weight files, the
 # Engram shards, the spill and the API key. Run it from where you want them, or set WORK=/somewhere. The
@@ -139,6 +152,7 @@ FLEET_SRC=${FLEET_SRC:-}                             # use this fleet file inste
 JOBS=${JOBS:-4}                                      # cmake/cargo parallelism (the recipe uses 4)
 KEEP_CHECKPOINT=${KEEP_CHECKPOINT:-1}                # 0: delete the checkpoint once the files are cut
 LOSSLESS=${LOSSLESS:-0}                              # 1: drop DSGB10_OEA (the lossy expert re-route)
+TUNED=${TUNED:-1}                                    # 1: the recipe's served engine/front-end tuning (see below)
 DSGB10_ADDR=${DSGB10_ADDR:-}                         # the front-end's addresses; empty: loopback + this box's LAN address
 DSGB10_PORT=${DSGB10_PORT:-8888}                     # 8888 is the recipe's production endpoint
 # service.sh refuses port 8888 unless DSGB10_PROD=1, so that follows the port unless set explicitly
@@ -1122,9 +1136,31 @@ serve_settings() {
   eargs+=" --draft-head4 --draft-markov8 --setenv DSGB10_HEAD4_C1=1"
   eargs+=" --setenv DSGB10_CF_MLP=$FLEET_BASE/cfmlp_cml.bin --setenv DSGB10_CF_ALPHA=1.0"
   eargs+=" --setenv DSGB10_CERT=1"
-  # DSGB10_RING_DIRECT=2 is for a switch (every rank one hop from every rank); this ring is switchless
+  # DSGB10_RING_DIRECT=2 and DSGB10_RING_RSBAL=1 are for a switch (every rank one hop from every
+  # rank); this ring is switchless, so neither is set here.
+  if [ "$TUNED" = 1 ]; then
+    # The recipe's served set (README, "run it"): every one of these leaves the output identical or
+    # the same distribution, and each is a throughput win on a GB10 ring.
+    eargs+=" --setenv DSGB10_WIDE_SH=1 --setenv DSGB10_WIDE_AR=2"
+    eargs+=" --setenv DSGB10_L2PF=d:d0=50,da=40,db=60,dh=35/c2:plan=wqa+wqb+woa+wob+gate+sh13+sh2,u1=wob,u2=wob,u3=wob,u4=sh2,w1=110,w2=50,w3=20,w3i=40,w4=60"
+    eargs+=" --setenv DSGB10_PF_TUNE=hc,small,down"
+    eargs+=" --setenv DSGB10_DRAFT_MAX=7 --setenv DSGB10_DRAFT_DYN=5"
+    eargs+=" --setenv DSGB10_REUSE_EXACT=1 --setenv DSGB10_HEADG=2"
+    eargs+=" --setenv DSGB10_GSAMPLE=1 --setenv DSGB10_GCOUPLE=0.8 --setenv DSGB10_GATE_SEP=1"
+    # copy drafts: a reply that repeats its prompt or the client's prediction is verified up to 64 rows
+    # a step. The agentic win: a file rewrite, an edit or echoed code is drafted, not generated.
+    eargs+=" --setenv DSGB10_COPY=1 --setenv DSGB10_COPY_LOG=1 --setenv DSGB10_COPY_ENTER=32"
+    eargs+=" --setenv DSGB10_COPY_SHARED=0 --setenv DSGB10_COPY_ROWS=64"
+    eargs+=" --setenv DSGB10_COPY_SW=1 --setenv DSGB10_COPY_DELTA=1"
+    # the copy steps' own graph: exact 32- and 64-row bodies from the decode kernels' arithmetic
+    eargs+=" --setenv DSGB10_NORM_EXACT=1 --setenv DSGB10_WIDE_EXACT=95 --setenv DSGB10_WIDE_EXACT_MT=2"
+    eargs+=" --setenv DSGB10_EXACT_SOLO=136"
+  fi
   local fargs="--tokenizer $TOKENIZER --model-name $MODEL_NAME --encoding $ENCODING"
   [ "$STREAM_TOOL_ARGS" = 1 ] && fargs+=" --stream-tool-args"
+  # --prediction lets a request's `prediction` field reach the engine as drafts (copy drafts use it);
+  # --max-image-rows-in-flight 40000 is the served cap: one full image request at a time.
+  [ "$TUNED" = 1 ] && fargs+=" --prediction --max-image-rows-in-flight 40000"
   # No --vision-addr here: service.sh adds it when it is given the encoder's command (DSGB10_VISION_CMD)
   # and refuses it in DSGB10_FRONT_ARGS.
   printf '%s\n%s\n%s\n' "$addrs" "$eargs" "$fargs"
@@ -1526,6 +1562,7 @@ instructions() {
   printf '  ./deploy-switchless.sh redeploy --fork   the newest branch with every fix (FORK_REF)\n'
   printf '  ./deploy-switchless.sh redeploy --fork --no-stream-args   ... without PR #7\n'
   printf '  ./deploy-switchless.sh redeploy --no-vision        ... without the image encoder\n'
+  printf '  ./deploy-switchless.sh redeploy --no-tuned         ... with the plain engine arguments\n'
   printf '\n'
 }
 
@@ -1547,6 +1584,8 @@ main() {
       --no-stream-args) STREAM_ARGS=0; STREAM_TOOL_ARGS=0; shift ;;
       --vision) VISION=1; shift ;;
       --no-vision) VISION=0; shift ;;
+      --tuned) TUNED=1; shift ;;
+      --no-tuned) TUNED=0; shift ;;
       --list) printf '%s\n' "${PHASES[@]}"; exit 0 ;;
       -h | --help) usage 0; exit 0 ;;
       deploy | all) CMD=deploy; shift ;;
