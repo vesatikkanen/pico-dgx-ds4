@@ -115,7 +115,7 @@ FORK_URL=https://github.com/vesatikkanen/pico-dgx-ds4.git
 # family's top-k as the sampling default). Their authors' work, not this script's. STREAM_TOOL_ARGS
 # and VISION are on with it. `--fork --no-stream-args` deploys BASE_REF instead (PRs #2, #3 and #15,
 # without #7); `--no-vision` leaves the encoder out.
-FORK_REF=${FORK_REF:-fix/tool-call-loop}
+FORK_REF=${FORK_REF:-fix/batch-drain}
 BASE_REF=${BASE_REF:-fix/sampler-and-dsml}
 FORK=${FORK:-0}                                      # 1: deploy FORK_REF from FORK_URL (--fork)
 REPO_URL=${REPO_URL:-$UPSTREAM_URL}                  # the clone's origin
@@ -689,14 +689,16 @@ netplan_write() {  # rank... -- netdev... -- ip...
 # By default this script deploys the repository it is in, at whatever that clone has checked out (or
 # REPO_REF, main, when it cloned the recipe itself).
 #
-# --fork deploys FORK_REF (fix/tool-call-loop) from FORK_URL instead: that
+# --fork deploys FORK_REF (fix/batch-drain) from FORK_URL instead: that
 # branch carries every fix the ring needs, all four pull requests (PR #3's sampler endpoint and PR #2's
 # DSML quarantine, both @ofan's; PR #7's streamed tool calls and PR #15's encoder in the service, both
 # @mpfaffenberger's), plus this fork's own work on top: the vision encoder in the service, the
-# `/metrics` endpoint sparkDash reads, PR #19's batch-norm fix (@grisetio), and the tool-call loop
+# `/metrics` endpoint sparkDash reads, PR #19's batch-norm fix (@grisetio), the tool-call loop
 # fixes (a `string="false"` value passed through as the reference does, both tag spellings held back
 # when streaming arguments, a short-line reasoning stall stopped, and the family's top-k as the
-# sampling default).
+# sampling default), and the batch drain (a stream's DONE the moment its own entry ends, not when the
+# run's last flight does: at 16 streams the closing chunk used to arrive a median 9.3 s after the last
+# token, and only 8.3 of the 16 streams produced tokens at any moment).
 #   ./deploy-switchless.sh redeploy --fork
 #
 # --fork --no-stream-args deploys BASE_REF (fix/sampler-and-dsml) instead: PRs #2, #3 and #15, without

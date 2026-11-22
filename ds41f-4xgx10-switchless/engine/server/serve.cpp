@@ -498,6 +498,9 @@ struct Flight {
   double t_start = 0, t_first = 0, t_paused = 0;
   double paused_s = 0, resume_s = 0, dec_s = 0;  // waiting in turn, resuming (to each first token), decoding
   int slices = 0, decoded = 0, batched = 0;  // runs; tokens decoded, of them in batches
+  bool ended = false;                // its DONE sent (when it ended inside the run, not at the run's end)
+  double t_end = 0;                  // when it ended: its DONE's decode time, not the run's end
+  uint32_t why_sent = 0;             // the reason its DONE carried: the state ops below use it, not a recompute
   DecodeEnd de;                      // the slices' drafts, summed
   double spec_tok = 1, spec_ms = 0;  // the drafts' rate (SpecRate) from slice to slice
 };
@@ -2043,11 +2046,19 @@ class Server {
     std::vector<BatchEnd> end(n);
     std::vector<DecodeEnd> dend;
     SpecBatchStats st;
+    // its DONE the moment its entry ends, not at the run's end: the other flights decode on while its client
+    // goes (finish_early). The loop's own decision, so a pause or a copy switch never ends a request here.
+    const OnStop on_stop = [&](int k, uint32_t why) {
+      finish_early(fl[k], why == kEndStop     ? fe::kStop
+                         : why == kEndLength  ? fe::kLength
+                         : why == kEndContext ? fe::kContext
+                                              : fe::kCancelled);
+    };
     if (drafts) {
-      dend = spec_batch_loop(m_, c, e, wd_, cb, &st);
+      dend = spec_batch_loop(m_, c, e, wd_, cb, &st, nullptr, 0, on_stop);
       for (int k = 0; k < n; ++k) end[k].sampled = dend[k].sampled, end[k].fed = dend[k].fed, end[k].why = dend[k].why;
     } else {
-      end = batch_loop(m_, c, e, wd_, cb);
+      end = batch_loop(m_, c, e, wd_, cb, on_stop);
     }
     if (ctl) m_.set_ctl(0);
     const double dt = now_s() - t_dec;
@@ -2076,6 +2087,9 @@ class Server {
                : (int)f.out.size() >= max_new                  ? fe::kLength
                : x.why == kEndPause                            ? kPaused
                                                                : kTurn;
+      // its DONE went out inside the run, on the loop's own decision: that reason is the one its state ops use,
+      // so a recompute here cannot disagree with what its client was told
+      if (f.ended) why[k] = f.why_sent;
       char b[64];
       std::snprintf(b, sizeof b, "%s%llu %d %s", k ? ", " : "", (unsigned long long)f.rq.h.req_id, x.sampled,
                     why[k] == kPaused ? "paused" : why[k] == kTurn ? "turn" : why[k] == fe::kStop ? "stop"
@@ -2129,14 +2143,26 @@ class Server {
     }
   }
 
-  // DONE, then the session kept (its snapshots thinned) or freed, and the store held to its budget; the
-  // requests held for the session go on.
-  void finish(Flight& f, uint32_t why) {
-    const fe::SubmitHeader& h = f.rq.h;
+  // DONE, the moment a flight ends: its client goes on while the run's other flights decode. Nothing here
+  // touches the session, so a request for it is still held (flying_) exactly as before: its state ops wait
+  // for the run's end (finish).
+  void finish_early(Flight& f, uint32_t why) {
+    if (f.ended) return;
+    f.ended = true;
+    f.why_sent = why;
+    f.t_end = now_s();
     done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
+  }
+
+  // DONE (already sent when the flight ended inside the run), then the session kept (its snapshots thinned)
+  // or freed, and the store held to its budget; the requests held for the session go on.
+  void finish(Flight& f, uint32_t why) {
+    finish_early(f, why);
+    why = f.why_sent;  // the reason its DONE carried: the state ops below must not disagree with it
+    const fe::SubmitHeader& h = f.rq.h;
     const bool cancelled = !f.rq.spans.empty() && Io::cancelled(f.rq);
     Io::forget(f.rq);
-    const double t_end = now_s();
+    const double t_end = f.t_end > 0 ? f.t_end : now_s();
     flying_.erase(h.session_id);
     const bool released = later_.erase(h.session_id) > 0;  // the front-end let it go meanwhile
     forget_evicted();

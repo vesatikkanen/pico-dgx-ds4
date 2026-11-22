@@ -368,6 +368,37 @@ top_p 1.0, top_k 20, and the kit's own serve takes a top-k (20) for exactly this
 |---|---|---|---|---|---|
 | 21 | `--top-k K` (20) is the default for a request that names none; a request's own `top_k` still wins, and `0` turns it off | `frontend/src/{main.rs,server.rs}` | on | no: this changes sampling, which is the point. Greedy (`temperature` 0) is untouched, and a request that sends `top_k` is untouched | `top_k = 0` (nucleus only, whole vocabulary) -> `top_k = 20` |
 
+## A stream's DONE goes out when its own entry ends, not when the run's last flight does (2026-11-21)
+
+`serve.cpp`'s `run()` collects up to `slot_.size()` flights and returns only when **every** one has ended;
+`finish()`, which sends the `kDone` frame, ran per flight *after* `run()` returned. So a stream that ended at
+step 3 of a 100-step run got its `[DONE]` at step 100. `docs/speed-bench.md` measured the cost at 16 streams:
+the closing chunk arrived a **median 9.3 s, mean 24 s, p90 71 s** after the last token, against 24 ms at one
+stream, and on average **8.3 of the 16 streams were producing tokens** at any moment. That file called it "a
+finding of this benchmark, not a property anyone asked for. It is not fixed in `v2.0`."
+
+The fix is an `OnStop` hook that each decode loop calls from the one place it decides an entry is done
+(`cmd.cpp`'s `batch_loop` `stop` and `spec_batch_loop` `finish`), so `serve.cpp` sends that flight's `DONE`
+there and then (`finish_early`). It is not sent from the `OnBatch` callback, which fires *before* the stop
+decision and so cannot know the reason, and which `batch_loop` re-fires for a trailing row on a pause — a
+token there could be a stop id. `kEndPause` and `kEndSwitch` are filtered out in both loops: the request goes
+on, so neither is an end. The two pre-loop guards that end an entry without decoding it (`max_new < 1`, or a
+position already at the limit) report through the same hook.
+
+`finish_early` only writes to the socket and reads already-final fields; `flying_` stays set, so a follow-up
+request for the same session is held in `held_` exactly as before, and `finish()` still runs every state op at
+the run's end. The unblocked client's next request sets `io_.submit_waiting()`, which makes the batch set
+`kCtlPause` and the run return, releasing the remaining flights.
+
+| # | Change | Files | Default | Same output | Before -> after |
+|---|---|---|---|---|---|
+| 22 | a flight's `DONE` is sent when its own entry ends, not at the run's end | `engine/server/{serve.cpp,cmd.cpp,cmd.h}` | on | yes: the tokens, their order and every session state op are unchanged; only the frame's timing moves | at 16 streams, closing chunk a median 9.3 s after the last token -> the moment the entry ends. Estimated +40-70 % aggregate throughput at 16 streams (245 -> ~350-410 tok/s), 0 % at one stream; the ring A/B is not yet run |
+
+`engine/server/tests/test_batch_drain.py` holds the contract: it extracts both lambdas verbatim and checks
+they report each end once with the loop's own reason, never for a pause or a copy switch, and that a null
+`OnStop` (which `main.cpp`'s loops pass) is not a crash. It also fails if a new `live[k] = 0` site appears
+without reporting its end, which is how the drain would come back.
+
 ## Upstream performance pull requests merged in (2026-11-20)
 
 The open upstream PRs that carry cache and checkpoint work were merged on top of the v2 merge. They are

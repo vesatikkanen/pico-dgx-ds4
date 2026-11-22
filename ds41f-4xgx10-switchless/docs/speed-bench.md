@@ -147,7 +147,9 @@ What this means for the numbers:
   waits for the end of the stream is held up by the longest request it shares the engine with. Any new
   request arriving ends the wait, so it shows only when all slots' clients are waiting at once.
 
-This is a finding of this benchmark, not a property anyone asked for. It is not fixed in `v2.0`.
+This is a finding of this benchmark, not a property anyone asked for. It is not fixed in `v2.0`; it is
+fixed on the fork's `fix/batch-drain` branch, where a flight's `DONE` goes out the moment its own entry ends
+(`CHANGES.md`, change 22). The figures above are the before side of that change.
 
 ## Draft acceptance, from the engine
 

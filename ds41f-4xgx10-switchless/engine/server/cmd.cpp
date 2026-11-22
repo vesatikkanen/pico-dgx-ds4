@@ -552,7 +552,7 @@ DecodeEnd decode_loop(model::Model& m, const Cmd& c, Watchdog& wd, const OnSampl
 }
 
 std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
-                                 const OnBatch& on) {
+                                 const OnBatch& on, const OnStop& on_stop) {
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
   const int n = (int)e.size(), slot0 = m.slot();
   std::vector<BatchEnd> end(n);
@@ -566,7 +566,10 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
     if (h > 0) pin.push_back(h);
   for (int k = 0; k < n; ++k) {
     if (e[k].handle >= 0) pin.push_back(e[k].handle);
-    if (!may_run(k, 0)) live[k] = 0, end[k].why = e[k].max_new < 1 ? kEndLength : kEndContext;
+    if (!may_run(k, 0)) {
+      live[k] = 0, end[k].why = e[k].max_new < 1 ? kEndLength : kEndContext;
+      if (on_stop) on_stop(k, end[k].why);  // it never decodes: its DONE now, not at the run's end
+    }
   }
   m.state_pin(pin);  // the sessions' stored state, while snapshots make room
   struct Step {
@@ -607,6 +610,7 @@ std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vecto
     end[k].why = why;
     if (launched[k] > end[k].sampled) ending[k] = 1;
     else live[k] = 0, end[k].fed = launched[k];
+    if (on_stop && why != kEndPause) on_stop(k, why);  // a pause is not an end: the request goes on
   };
   launch();
   launch();  // queued behind the first, its tokens from the device
@@ -725,7 +729,8 @@ std::vector<float> batch_tf_loop(model::Model& m, const Cmd& c, const std::vecto
 
 // B3 (cmd.h): spec_loop's accounting per entry, over batch spec steps
 std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
-                                       const OnBatch& on, SpecBatchStats* st, CopySrc* ext, int solo) {
+                                       const OnBatch& on, SpecBatchStats* st, CopySrc* ext, int solo,
+                                       const OnStop& on_stop) {
   constexpr int kD = model::ops::kDrafts;
   g_t_wait.clear(), g_t_late.clear(), g_t_launch.clear();
   const int n = (int)e.size(), slot0 = m.slot();
@@ -775,7 +780,10 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     nx[k].pos0 = x.pos0, nx[k].tok[0] = x.token;
     next_snap[k] = x.snap_every > 0 ? (x.pos0 / x.snap_every + 1) * x.snap_every : INT32_MAX;
     if (x.handle >= 0) pin.push_back(x.handle);
-    if (x.max_new < 1 || x.pos0 >= x.limit) live[k] = 0, d.why = x.max_new < 1 ? kEndLength : kEndContext;
+    if (x.max_new < 1 || x.pos0 >= x.limit) {
+      live[k] = 0, d.why = x.max_new < 1 ? kEndLength : kEndContext;
+      if (on_stop) on_stop(k, d.why);  // it never decodes: its DONE now, not at the run's end
+    }
   }
   m.state_pin(pin);  // the sessions' stored state, while snapshots make room
   // entry k's window snapshots up to kv_end (positions below it hold its history's KV; the ring holds
@@ -792,6 +800,8 @@ std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std:
     live[k] = 0, ending[k] = 0, pend[k] = 0;
     end[k].fed = kv_end - e[k].pos0;
     end[k].last = toks[k][end[k].fed - 1];
+    // a pause and a copy switch are not ends: the request goes on
+    if (on_stop && end[k].why != kEndPause && end[k].why != kEndSwitch) on_stop(k, end[k].why);
   };
   struct Step {
     uint64_t id = 0;
