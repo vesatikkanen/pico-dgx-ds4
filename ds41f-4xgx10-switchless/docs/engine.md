@@ -3113,14 +3113,6 @@ GPU work that the session's state needs. Sending DONE before that work is the on
 bits, and on the edit bench it is worth about 2 ms a turn (0.2 %), far under the 2 % bar. Through pi
 itself it is worth 9–11 ms a turn (0.6–0.7 %; "pi's turnaround", below), still under it.
 
-**Scope: one stream.** Every figure here is a single request decoding alone, where the tail is one
-step's GPU time. In a batch the tail is not one step but the whole run: `run()` returns only when
-every flight in it has ended, so a stream that ends at step 3 of a 100-step run waits 97 steps for
-its DONE. That is a different problem with a different size — a median 9.3 s at 16 streams
-(`speed-bench.md`) — and it is fixed on the fork's `fix/batch-drain` branch (`CHANGES.md`, change 22)
-by sending DONE from the loop's own end decision. The bit-safety argument is the same one below: the
-step still runs, and the next request on the session still starts after it.
-
 **The question.** In agentic use the end of every turn gates the client's next request. Two things
 were measured:
 

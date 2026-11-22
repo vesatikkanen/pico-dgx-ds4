@@ -425,6 +425,22 @@ int reuse_exact() {
   return v;
 }
 
+// DSGB10_END_EARLY=1 (default 0: as before). A request that ends while others of its run go on (its stop id, its
+// max_new_tokens, or its cancel seen) gets its DONE at that token, not when the run returns: its client's stream closes
+// at once. Its session stays in flight until the run returns (finish() does the rest, unchanged), and from then on the
+// next request that arrives pauses the run as an arrival does when a slot is free: the run returns, the ended requests'
+// sessions are kept and their slots can be taken. No step's rows or arithmetic change; without an arrival nothing but
+// the time of the DONE does.
+bool end_early() {
+  static const bool v = [] {
+    const char* e = getenv("DSGB10_END_EARLY");
+    const bool x = e && atoi(e) > 0;
+    if (x) std::printf("serve: DSGB10_END_EARLY=1: a request's DONE goes out at the step where it ends\n");
+    return x;
+  }();
+  return v;
+}
+
 // The server's index of a planned stop's kept sessions (keep(); keepfile.h: 0600 in a 0700 directory,
 // whole or not at all): a header, then each session: id, handle, restart ranges, LRU clock and time,
 // history, encoder-only snapshots.
@@ -498,11 +514,10 @@ struct Flight {
   double t_start = 0, t_first = 0, t_paused = 0;
   double paused_s = 0, resume_s = 0, dec_s = 0;  // waiting in turn, resuming (to each first token), decoding
   int slices = 0, decoded = 0, batched = 0;  // runs; tokens decoded, of them in batches
-  bool ended = false;                // its DONE sent (when it ended inside the run, not at the run's end)
-  double t_end = 0;                  // when it ended: its DONE's decode time, not the run's end
-  uint32_t why_sent = 0;             // the reason its DONE carried: the state ops below use it, not a recompute
   DecodeEnd de;                      // the slices' drafts, summed
   double spec_tok = 1, spec_ms = 0;  // the drafts' rate (SpecRate) from slice to slice
+  double t_done = 0;                 // DSGB10_END_EARLY: when its DONE went out inside its run (0: not yet), and its reason
+  uint32_t why_done = 0;
 };
 
 // b's drafts and steps added to a's (a request's decode slices)
@@ -2024,6 +2039,15 @@ class Server {
     uint32_t ctl = 0;
     std::vector<std::vector<int32_t>> samples(n);
     std::vector<char> cancel(n, 0);
+    // DSGB10_END_EARLY: the requests of this run whose DONE went out already (ended or cancelled). Their sessions stay
+    // in flight until the run returns, so a request that arrives pauses the run for them as it does for a free slot.
+    const bool early = end_early();
+    int gone = 0;
+    auto end_now = [&](Flight& f, uint32_t reason) {
+      done(f.rq, reason, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
+      f.t_done = now_s(), f.why_done = reason;
+      ++gone;
+    };
     const OnBatch cb = [&](int k, const model::SampleOut& o, int row) {
       Flight& f = fl[k];
       samples[k].push_back(o.row[row].token);
@@ -2032,33 +2056,28 @@ class Server {
       if (Io::cancelled(f.rq)) {  // its slot's bit: it ends after the step that reads it
         cancel[k] = 1;
         m_.set_ctl(ctl |= 1u << e[k].slot);
+        if (early && f.t_done <= 0) end_now(f, fe::kCancelled);  // its tokens stop here; the run's end says cancelled too
         return;
       }
+      if (f.t_done > 0) return;  // never: an ended request has no further token
       const int32_t t = o.row[row].token;
       tokens(f.rq, o, row);  // a paused request's last tokens too: the session holds them
       f.out.push_back(t);
       // a new request pauses the batch when it can have a slot; one waiting for a slot does when this one
       // ends, which frees one (its session no longer in flight)
       const bool ends = stop_id(f, t) || (int)f.out.size() >= (int)f.rq.h.max_new_tokens;
-      if (!(ctl & kCtlPause) && (io_.submit_waiting() || !wait_.empty()) && (ends || admissible()))
+      if (early && ends) end_now(f, stop_id(f, t) ? fe::kStop : fe::kLength);  // the reasons the run's end gives it
+      if (!(ctl & kCtlPause) && (io_.submit_waiting() || !wait_.empty()) && (ends || gone > 0 || admissible()))
         m_.set_ctl(ctl |= kCtlPause);
     };
     std::vector<BatchEnd> end(n);
     std::vector<DecodeEnd> dend;
     SpecBatchStats st;
-    // its DONE the moment its entry ends, not at the run's end: the other flights decode on while its client
-    // goes (finish_early). The loop's own decision, so a pause or a copy switch never ends a request here.
-    const OnStop on_stop = [&](int k, uint32_t why) {
-      finish_early(fl[k], why == kEndStop     ? fe::kStop
-                         : why == kEndLength  ? fe::kLength
-                         : why == kEndContext ? fe::kContext
-                                              : fe::kCancelled);
-    };
     if (drafts) {
-      dend = spec_batch_loop(m_, c, e, wd_, cb, &st, nullptr, 0, on_stop);
+      dend = spec_batch_loop(m_, c, e, wd_, cb, &st);
       for (int k = 0; k < n; ++k) end[k].sampled = dend[k].sampled, end[k].fed = dend[k].fed, end[k].why = dend[k].why;
     } else {
-      end = batch_loop(m_, c, e, wd_, cb, on_stop);
+      end = batch_loop(m_, c, e, wd_, cb);
     }
     if (ctl) m_.set_ctl(0);
     const double dt = now_s() - t_dec;
@@ -2087,9 +2106,11 @@ class Server {
                : (int)f.out.size() >= max_new                  ? fe::kLength
                : x.why == kEndPause                            ? kPaused
                                                                : kTurn;
-      // its DONE went out inside the run, on the loop's own decision: that reason is the one its state ops use,
-      // so a recompute here cannot disagree with what its client was told
-      if (f.ended) why[k] = f.why_sent;
+      if (f.t_done > 0 && why[k] != f.why_done) {  // never: its DONE went out with the reason the run's end gives
+        std::printf("serve: req %llu: DONE went out early with reason %u, the run ended it with %u\n",
+                    (unsigned long long)f.rq.h.req_id, f.why_done, why[k]);
+        why[k] = f.why_done;
+      }
       char b[64];
       std::snprintf(b, sizeof b, "%s%llu %d %s", k ? ", " : "", (unsigned long long)f.rq.h.req_id, x.sampled,
                     why[k] == kPaused ? "paused" : why[k] == kTurn ? "turn" : why[k] == fe::kStop ? "stop"
@@ -2143,26 +2164,14 @@ class Server {
     }
   }
 
-  // DONE, the moment a flight ends: its client goes on while the run's other flights decode. Nothing here
-  // touches the session, so a request for it is still held (flying_) exactly as before: its state ops wait
-  // for the run's end (finish).
-  void finish_early(Flight& f, uint32_t why) {
-    if (f.ended) return;
-    f.ended = true;
-    f.why_sent = why;
-    f.t_end = now_s();
-    done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
-  }
-
-  // DONE (already sent when the flight ended inside the run), then the session kept (its snapshots thinned)
-  // or freed, and the store held to its budget; the requests held for the session go on.
+  // DONE, then the session kept (its snapshots thinned) or freed, and the store held to its budget; the
+  // requests held for the session go on.
   void finish(Flight& f, uint32_t why) {
-    finish_early(f, why);
-    why = f.why_sent;  // the reason its DONE carried: the state ops below must not disagree with it
     const fe::SubmitHeader& h = f.rq.h;
+    if (f.t_done <= 0) done(f.rq, why, (uint32_t)f.q, (uint32_t)f.out.size(), f.t_start, f.t_first);
     const bool cancelled = !f.rq.spans.empty() && Io::cancelled(f.rq);
     Io::forget(f.rq);
-    const double t_end = f.t_end > 0 ? f.t_end : now_s();
+    const double t_end = f.t_done > 0 ? f.t_done : now_s();  // DSGB10_END_EARLY: its DONE went out inside its run
     flying_.erase(h.session_id);
     const bool released = later_.erase(h.session_id) > 0;  // the front-end let it go meanwhile
     forget_evicted();
@@ -2201,10 +2210,14 @@ class Server {
     }
     // the decode's time: from the first token to the end, less the time paused and resuming
     const double t_dec = f.t_first > 0 ? std::max(0.0, t_end - f.t_first - f.paused_s - f.resume_s) : 0;
-    char sl[128] = "";  // (a request waits a moment in the turns between its first token and its decode)
+    char sl[224] = "";  // (a request waits a moment in the turns between its first token and its decode)
     if (f.slices > 1 || f.paused_s >= 0.005 || f.batched)
       std::snprintf(sl, sizeof sl, "; %d slices, paused %.2f s, resumes %.1f ms, %d tokens in batches", f.slices,
                     f.paused_s, 1e3 * f.resume_s, f.batched);
+    if (f.t_done > 0) {
+      const size_t at = std::strlen(sl);
+      std::snprintf(sl + at, sizeof sl - at, "; done sent %.1f ms before its run returned", 1e3 * (now_s() - f.t_done));
+    }
     std::printf("serve: req %llu session %016llx: prompt %u, reused %d (%s), prefill %.1f ms (%.0f tok/s), %zu tokens "
                 "in %.1f ms (%.1f tok/s), %s; store %.1f MiB; session %d positions, %.1f MiB, %zu window snapshots%s\n",
                 (unsigned long long)h.req_id, (unsigned long long)h.session_id, h.n_prompt, f.q, kHow[f.pl.how],
@@ -2277,6 +2290,7 @@ int serve(model::Model& m, comm::Ring& ring, Watchdog& wd, const ServeOptions& o
   Io io(o.socket, Frame(fe::kHelloEngine).add(&hi).add(o.name.data(), o.name.size()).take());
   std::printf("serve: listening on %s (context %d, session store %.2f GiB, kept between requests %.2f GiB)\n",
               o.socket.c_str(), o.max_ctx, m.state_capacity() / 1073741824.0, budget / 1073741824.0);
+  end_early();  // its line in the start log
   Server s(m, ring, wd, o, io, budget);
   s.load_kept();
   s.loop();

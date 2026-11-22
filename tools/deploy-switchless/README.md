@@ -459,7 +459,7 @@ Every setting is an environment variable, and the ones with a flag have one.
 | --- | --- | --- |
 | `REPO_REF` | `main` | the ref to deploy when the clone has no branch checked out (or the script cloned it) |
 | `FORK` (`--fork`) | 0 | deploy `FORK_REF` from `FORK_URL` instead |
-| `FORK_REF` | `fix/batch-drain` | the branch `--fork` deploys: the newest one with every fix |
+| `FORK_REF` | `fix/tool-call-loop` | the branch `--fork` deploys: the newest one with every fix |
 | `BASE_REF` | `fix/sampler-and-dsml` | the branch `--fork --no-stream-args` deploys |
 | `REF` (`--ref`) | | a commit, branch or tag to deploy instead |
 | `PR` (`--pr`) | | a pull request's head to deploy instead |
@@ -571,7 +571,6 @@ so a ring deployed with `--fork` runs it.
 | `GET /metrics` on dsfront | the Prometheus text exposition sparkDash scrapes: the two request gauges, the token counters, TTFT and the engine's own prefill time, under the `tensorfold:` prefix so a scraper already reading a TensorFold serve reads this one unchanged ([docs/operations.md](../../ds41f-4xgx10-switchless/docs/operations.md)). **[@100menotu001](https://github.com/100menotu001)'s work, from [PR #12](https://github.com/Picom-code/pico-dgx-ds4/pull/12)**; this fork only carries it onto the branch |
 | PR #19's batch-norm fix | the 9..16-row norms run with the fused call's CTA, so a session decoded in a batch of 9..16 rows (or a drafted batch of two or more) is bit-identical to the same session alone ([CHANGES.md](../../CHANGES.md), change 17) |
 | the tool-call loop fixes | a `string="false"` value the model wrote as a bare word is passed through as `encoding.py` does instead of answered with HTTP 500; both tag spellings are held back when streaming a call's arguments; repeated reasoning intentions can be stopped before reaching `max_tokens`; and `top_k` defaults to 20, the family's sampler, instead of the nucleus alone. Detected loops return an error rather than a successful completion; `--no-loop-guard` disables the guards ([CHANGES.md](../../CHANGES.md), changes 18-21 and mixed-length reasoning stalls) |
-| the batch drain | a stream's `[DONE]` goes out the moment its own entry ends, not when the run's last flight does. At 16 streams the closing chunk used to arrive a median 9.3 s after the last token (p90 71 s) and only 8.3 of the 16 streams were producing tokens at any moment; at one stream it was 24 ms ([docs/speed-bench.md](../../ds41f-4xgx10-switchless/docs/speed-bench.md), [CHANGES.md](../../CHANGES.md), change 22) |
 
 The `/metrics` endpoint is additive: a build without it answers 404 and every consumer behaves as
 before, so nothing that reads the engine today changes.

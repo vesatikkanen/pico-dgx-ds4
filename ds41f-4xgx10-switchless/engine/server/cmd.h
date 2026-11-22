@@ -276,11 +276,8 @@ struct BatchEnd {
   uint32_t why = kEndStop;
 };
 using OnBatch = std::function<void(int k, const model::SampleOut& o, int row)>;  // entry k's next token: o.row[row]
-// entry k's stop decision, as the loop makes it (kEndStop, kEndLength, kEndContext, kEndCancel): the caller may
-// end the request there, while the other entries decode on. Not called for kEndPause or kEndSwitch (not ends).
-using OnStop = std::function<void(int k, uint32_t why)>;
 std::vector<BatchEnd> batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
-                                 const OnBatch& on, const OnStop& on_stop = nullptr);
+                                 const OnBatch& on);
 
 // kCmdBatchTf (docs/batching.md, B4): the entries' rows teacher-forced, in steps of up to c.rows rows of each
 // (1..model::kMaxSessRows; a step of at most kMaxRows rows in all). Entry k feeds tokens[k] (e[k].max_new of
@@ -322,7 +319,7 @@ struct SpecBatchStats {
 struct CopySrc;
 std::vector<DecodeEnd> spec_batch_loop(model::Model& m, const Cmd& c, const std::vector<BatchEntry>& e, Watchdog& wd,
                                        const OnBatch& on, SpecBatchStats* st = nullptr, CopySrc* ext = nullptr,
-                                       int solo = 0, const OnStop& on_stop = nullptr);
+                                       int solo = 0);
 
 // Host timeline of the last decode loop (diagnostics): per step, when its sample arrived, when the
 // next step's Engram lookups were submitted, and when the step after was launched.
