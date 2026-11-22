@@ -399,6 +399,13 @@ they report each end once with the loop's own reason, never for a pause or a cop
 `OnStop` (which `main.cpp`'s loops pass) is not a crash. It also fails if a new `live[k] = 0` site appears
 without reporting its end, which is how the drain would come back.
 
+`engine/server/tests/test_flight_done.py` covers the other half, the single-flight path (`decode_one`), where
+`run()` calls `finish()` alone at the run's end and no loop is involved. It extracts `finish_early` and
+`finish`'s head verbatim and checks that both paths send the DONE exactly once, that `finish()` still sends it
+itself (or the single-flight path would send none), that a second `finish_early` sends nothing more, that
+`t_end` stays the DONE's time rather than the run's end, and that the reason the client was told is the one
+the state ops use.
+
 ## Upstream performance pull requests merged in (2026-11-20)
 
 The open upstream PRs that carry cache and checkpoint work were merged on top of the v2 merge. They are
