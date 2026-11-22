@@ -694,9 +694,10 @@ netplan_write() {  # rank... -- netdev... -- ip...
 # DSML quarantine, both @ofan's; PR #7's streamed tool calls and PR #15's encoder in the service, both
 # @mpfaffenberger's), plus this fork's own work on top: the vision encoder in the service, the
 # `/metrics` endpoint sparkDash reads, PR #19's batch-norm fix (@grisetio), PR #10's RoCE GID lookup by
-# address (@SvangenStudios), and the tool-call loop fixes (a `string="false"` value passed through as
-# the reference does, both tag spellings held back when streaming arguments, a short-line reasoning
-# stall stopped, and the family's top-k as the sampling default).
+# address (@SvangenStudios), PR #25's prefill/decode interleaving (@sayyidfareed), and the tool-call loop
+# fixes (a `string="false"` value passed through as the reference does, both tag spellings held back when
+# streaming arguments, a short-line reasoning stall stopped, and the family's top-k as the sampling
+# default).
 #   ./deploy-switchless.sh redeploy --fork
 #
 # --fork --no-stream-args deploys BASE_REF (fix/sampler-and-dsml) instead: PRs #2, #3 and #15, without
@@ -1159,6 +1160,13 @@ serve_settings() {
     # used to arrive a median 9.3 s after the last token, and only 8.3 of the 16 streams produced tokens
     # (docs/speed-bench.md). 326 tok/s against 245 with it off.
     eargs+=" --setenv DSGB10_END_EARLY=1"
+    # one decode step of a resident text stream between chunks of another's prefill (PR #25). Without it a
+    # prefill runs whole inside the loop, so every stream already decoding is silent until the new request
+    # has its first token: with several agents starting together, each one's prefill stalls the others.
+    # Measured with three peers streaming: longest peer silence 22.2 s -> 3.7 s on a 160K prompt, 44.4 s ->
+    # 3.8 s on a 320K one, for 1.5-2.9 s more to the incoming request's first token. Throughput is flat
+    # (186.2 -> 185.2 tok/s at 4 streams, 245.4 -> 241.9 at 8, 283.9 -> 284.2 at 12).
+    eargs+=" --setenv DSGB10_ORDINARY_PREFILL_DECODE=1"
   fi
   local fargs="--tokenizer $TOKENIZER --model-name $MODEL_NAME --encoding $ENCODING"
   [ "$STREAM_TOOL_ARGS" = 1 ] && fargs+=" --stream-tool-args"

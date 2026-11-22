@@ -50,6 +50,11 @@ struct Model {
 };
 }
 
+namespace dspark {
+inline int draft_rows() { return 5; }
+inline int draft_rows_batch() { return 5; }
+}
+
 enum { kCmdPrefill, kCmdRows, kCmdImages, kCmdState, kCmdDecode };
 enum { kPfSample = 1, kPfCed = 2, kStDropSnap = 1, kStSnap = 2 };
 enum : uint32_t { kEndStop, kEndLength, kEndCancel, kEndContext };
@@ -72,7 +77,7 @@ uint64_t run_prefill(model::Model& m, const Cmd& c) {
   return c.flags & kPfSample ? 0 : ~0ull;
 }
 uint64_t run_rows(model::Model&, const Cmd&) { return 0; }
-bool keep_snap(int, int, int) { return true; }
+bool keep_snap(int, int, int, bool) { return true; }
 
 struct DecodeEnd {
   uint32_t why = kEndLength;
@@ -121,12 +126,12 @@ struct Flight {
   DecodeEnd de;
 };
 struct Session {
-  int h = 0, slot = -1, w = 0, dec_lo = 0, pe_snap = -1;
+  int h = 0, slot = -1, w = 0, dec_lo = 0, pe_snap = -1, pf = 0;
   std::vector<int32_t> hist, enc_snaps;
 };
 struct Options {
   int prefill_rows = 128, small_rows = 8, snap_every = 128, slice = 64;
-  bool snap_thin = true, spec = true;
+  bool snap_thin = true, spec = true, keep_early_snapshot = false;
   int spec_drafts = 5, spec_gate = 0;
   float spec_thresh = 0, spec_cost[3]{}, spec_row_ms[6]{};
 };

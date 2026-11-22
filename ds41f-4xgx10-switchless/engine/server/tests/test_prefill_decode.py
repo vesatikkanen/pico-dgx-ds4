@@ -20,7 +20,7 @@ def main():
     helpers = ""
     if "static bool prefill_decode_enabled()" in source:
         helpers = section(source, "  static bool prefill_decode_enabled()", "  // Flight f's prompt run")
-    tail = section(source, "    // ---- prefill [q, n)", "  // Vision: rq")
+    tail = section(source, "    // ---- prefill [q, n)", "  void images(const Request& rq, int q) {")
     decode = section(source, "  static constexpr uint32_t kPaused", "  // A run: the requests")
     decode += section(source, "  void rejoin(", "  // The flights' run together")
     with tempfile.TemporaryDirectory(prefix="pico-prefill-decode-") as temp:
@@ -34,6 +34,9 @@ def main():
             + "    const int n = (int)prompt.size();\n"
             + "    Turn& tu = f.tu;\n"
             + "    const double t0 = now_s();\n"
+            + "    const int lvl = 0;\n"
+            + "    const int src_pf = 0;\n"
+            + "    bool all_pf = true;\n"
             + tail
             + decode
         )

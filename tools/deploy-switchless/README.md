@@ -502,6 +502,7 @@ hand-editing the arguments. Every variable in it leaves the output identical or 
 | copy drafts | `DSGB10_COPY=1`, `COPY_ROWS=64`, `COPY_ENTER=32`, `COPY_SHARED=0`, `COPY_SW=1`, `COPY_DELTA=1`, `COPY_LOG=1` |
 | copy steps' exact bodies | `DSGB10_EXACT_SOLO=136`, `DSGB10_NORM_EXACT=1`, `DSGB10_WIDE_EXACT=95`, `DSGB10_WIDE_EXACT_MT=2` |
 | stream end | `DSGB10_END_EARLY=1` |
+| prefill interleaving | `DSGB10_ORDINARY_PREFILL_DECODE=1` |
 | front-end | `--prediction`, `--max-image-rows-in-flight 40000` |
 
 Two of the recipe's served variables are **not** set: `DSGB10_RING_DIRECT=2` and
@@ -513,6 +514,24 @@ where its request ends, not when its run returns. Without it, at 16 streams the 
 median 9.3 s after the last token and only 8.3 of the 16 streams were producing tokens; with it, 326
 tok/s against 245 ([docs/speed-bench.md](../../ds41f-4xgx10-switchless/docs/speed-bench.md)). It is off
 by default upstream, so `TUNED=0` leaves it off.
+
+`DSGB10_ORDINARY_PREFILL_DECODE=1` is PR #25 (@sayyidfareed), and it fixes the other half of the same
+symptom. A prefill runs whole inside the engine's loop, so while one request is being prefilled every
+stream already decoding is silent until that request has its first token. With several agents starting
+together, each one's prefill stalls the others, and the whole group appears to wait before any of them
+produces output. With the variable set, a resident text stream gets one decode step between chunks of
+another's prefill, rotating through the slots. Measured with three peers already streaming: the longest
+peer silence fell from 22.2 s to 3.7 s on a 32K-cached-prefix + 160K-new-token prompt, and from 44.4 s
+to 3.8 s on a 320K cold one, at the cost of 1.5–2.9 s more to the incoming request's own first token.
+Aggregate throughput is flat (186.2 → 185.2 tok/s at 4 streams, 245.4 → 241.9 at 8, 283.9 → 284.2 at
+12). It is off by default upstream, so `TUNED=0` leaves it off. It applies to new text requests only,
+not to image requests or to flights resuming after slot displacement.
+
+One caveat, from PR #25's own measurements: the two arms' open-ended peer outputs differed, though both
+passed all five long-text recall checks and all twelve image checks. So this is the one variable in the
+`TUNED=1` set that is not output-identical — it changes *when* a peer's steps run relative to another
+request's prefill, and the peer's text can differ from a run with it off. Set `TUNED=0` or drop the
+variable if bit-identical peer output matters more than the shorter silence.
 
 `DSGB10_COPY` is the one that matters most for agent work: a reply that repeats text already in the
 prompt (a file rewrite, an edit, echoed code) or in the client's `prediction` is drafted from that text
