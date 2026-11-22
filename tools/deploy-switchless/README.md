@@ -459,7 +459,7 @@ Every setting is an environment variable, and the ones with a flag have one.
 | --- | --- | --- |
 | `REPO_REF` | `main` | the ref to deploy when the clone has no branch checked out (or the script cloned it) |
 | `FORK` (`--fork`) | 0 | deploy `FORK_REF` from `FORK_URL` instead |
-| `FORK_REF` | `fix/tool-call-loop` | the branch `--fork` deploys: the newest one with every fix |
+| `FORK_REF` | `fix/batch-drain` | the branch `--fork` deploys: the newest one with every fix |
 | `BASE_REF` | `fix/sampler-and-dsml` | the branch `--fork --no-stream-args` deploys |
 | `REF` (`--ref`) | | a commit, branch or tag to deploy instead |
 | `PR` (`--pr`) | | a pull request's head to deploy instead |
@@ -501,11 +501,18 @@ hand-editing the arguments. Every variable in it leaves the output identical or 
 | prompt reuse | `DSGB10_REUSE_EXACT=1` |
 | copy drafts | `DSGB10_COPY=1`, `COPY_ROWS=64`, `COPY_ENTER=32`, `COPY_SHARED=0`, `COPY_SW=1`, `COPY_DELTA=1`, `COPY_LOG=1` |
 | copy steps' exact bodies | `DSGB10_EXACT_SOLO=136`, `DSGB10_NORM_EXACT=1`, `DSGB10_WIDE_EXACT=95`, `DSGB10_WIDE_EXACT_MT=2` |
+| stream end | `DSGB10_END_EARLY=1` |
 | front-end | `--prediction`, `--max-image-rows-in-flight 40000` |
 
 Two of the recipe's served variables are **not** set: `DSGB10_RING_DIRECT=2` and
 `DSGB10_RING_RSBAL=1` are for a switch, where every rank reaches every rank in one hop, and this ring
 is switchless. `--no-tuned` (`TUNED=0`) starts the service with the plain arguments instead.
+
+`DSGB10_END_EARLY=1` is upstream's own fix, not this fork's: a stream's `[DONE]` goes out at the step
+where its request ends, not when its run returns. Without it, at 16 streams the closing chunk arrived a
+median 9.3 s after the last token and only 8.3 of the 16 streams were producing tokens; with it, 326
+tok/s against 245 ([docs/speed-bench.md](../../ds41f-4xgx10-switchless/docs/speed-bench.md)). It is off
+by default upstream, so `TUNED=0` leaves it off.
 
 `DSGB10_COPY` is the one that matters most for agent work: a reply that repeats text already in the
 prompt (a file rewrite, an edit, echoed code) or in the client's `prediction` is drafted from that text
@@ -569,7 +576,8 @@ so a ring deployed with `--fork` runs it.
 | --- | --- |
 | the vision encoder in the service | PR #15's `DSGB10_VISION_CMD` wiring, with `VISION=1` starting, restarting and stopping the encoder with the service |
 | `GET /metrics` on dsfront | the Prometheus text exposition sparkDash scrapes: the two request gauges, the token counters, TTFT and the engine's own prefill time, under the `tensorfold:` prefix so a scraper already reading a TensorFold serve reads this one unchanged ([docs/operations.md](../../ds41f-4xgx10-switchless/docs/operations.md)). **[@100menotu001](https://github.com/100menotu001)'s work, from [PR #12](https://github.com/Picom-code/pico-dgx-ds4/pull/12)**; this fork only carries it onto the branch |
-| PR #19's batch-norm fix | the 9..16-row norms run with the fused call's CTA, so a session decoded in a batch of 9..16 rows (or a drafted batch of two or more) is bit-identical to the same session alone ([CHANGES.md](../../CHANGES.md), change 17) |
+| PR #19's batch-norm fix | the 9..16-row norms run with the fused call's CTA, so a session decoded in a batch of 9..16 rows (or a drafted batch of two or more) is bit-identical to the same session alone. The second commit (issue #18) extends that to a 9..16-row step of several entries when `DSGB10_EXACT_SOLO` is set, which `TUNED=1` does ([CHANGES.md](../../CHANGES.md), change 17) |
+| PR #10's RoCE GID lookup | the link's RoCE v2 GID is found by address, not by trusting `GID_INDEX`: a box that loses power can come back with its GID at another index, and the fleet file's check is about the address. **[@SvangenStudios](https://github.com/SvangenStudios)'s work, from [PR #10](https://github.com/Picom-code/pico-dgx-ds4/pull/10)**; this fork only carries it onto the branch |
 | the tool-call loop fixes | a `string="false"` value the model wrote as a bare word is passed through as `encoding.py` does instead of answered with HTTP 500; both tag spellings are held back when streaming a call's arguments; repeated reasoning intentions can be stopped before reaching `max_tokens`; and `top_k` defaults to 20, the family's sampler, instead of the nucleus alone. Detected loops return an error rather than a successful completion; `--no-loop-guard` disables the guards ([CHANGES.md](../../CHANGES.md), changes 18-21 and mixed-length reasoning stalls) |
 
 The `/metrics` endpoint is additive: a build without it answers 404 and every consumer behaves as

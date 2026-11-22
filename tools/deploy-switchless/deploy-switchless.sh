@@ -115,7 +115,7 @@ FORK_URL=https://github.com/vesatikkanen/pico-dgx-ds4.git
 # family's top-k as the sampling default). Their authors' work, not this script's. STREAM_TOOL_ARGS
 # and VISION are on with it. `--fork --no-stream-args` deploys BASE_REF instead (PRs #2, #3 and #15,
 # without #7); `--no-vision` leaves the encoder out.
-FORK_REF=${FORK_REF:-fix/tool-call-loop}
+FORK_REF=${FORK_REF:-fix/batch-drain}
 BASE_REF=${BASE_REF:-fix/sampler-and-dsml}
 FORK=${FORK:-0}                                      # 1: deploy FORK_REF from FORK_URL (--fork)
 REPO_URL=${REPO_URL:-$UPSTREAM_URL}                  # the clone's origin
@@ -689,14 +689,14 @@ netplan_write() {  # rank... -- netdev... -- ip...
 # By default this script deploys the repository it is in, at whatever that clone has checked out (or
 # REPO_REF, main, when it cloned the recipe itself).
 #
-# --fork deploys FORK_REF (fix/tool-call-loop) from FORK_URL instead: that
+# --fork deploys FORK_REF (fix/batch-drain) from FORK_URL instead: that
 # branch carries every fix the ring needs, all four pull requests (PR #3's sampler endpoint and PR #2's
 # DSML quarantine, both @ofan's; PR #7's streamed tool calls and PR #15's encoder in the service, both
 # @mpfaffenberger's), plus this fork's own work on top: the vision encoder in the service, the
-# `/metrics` endpoint sparkDash reads, PR #19's batch-norm fix (@grisetio), and the tool-call loop
-# fixes (a `string="false"` value passed through as the reference does, both tag spellings held back
-# when streaming arguments, a short-line reasoning stall stopped, and the family's top-k as the
-# sampling default).
+# `/metrics` endpoint sparkDash reads, PR #19's batch-norm fix (@grisetio), PR #10's RoCE GID lookup by
+# address (@SvangenStudios), and the tool-call loop fixes (a `string="false"` value passed through as
+# the reference does, both tag spellings held back when streaming arguments, a short-line reasoning
+# stall stopped, and the family's top-k as the sampling default).
 #   ./deploy-switchless.sh redeploy --fork
 #
 # --fork --no-stream-args deploys BASE_REF (fix/sampler-and-dsml) instead: PRs #2, #3 and #15, without
@@ -1155,6 +1155,10 @@ serve_settings() {
     # the copy steps' own graph: exact 32- and 64-row bodies from the decode kernels' arithmetic
     eargs+=" --setenv DSGB10_NORM_EXACT=1 --setenv DSGB10_WIDE_EXACT=95 --setenv DSGB10_WIDE_EXACT_MT=2"
     eargs+=" --setenv DSGB10_EXACT_SOLO=136"
+    # a stream's DONE at the step where it ends, not when its run returns: at 16 streams the closing chunk
+    # used to arrive a median 9.3 s after the last token, and only 8.3 of the 16 streams produced tokens
+    # (docs/speed-bench.md). 326 tok/s against 245 with it off.
+    eargs+=" --setenv DSGB10_END_EARLY=1"
   fi
   local fargs="--tokenizer $TOKENIZER --model-name $MODEL_NAME --encoding $ENCODING"
   [ "$STREAM_TOOL_ARGS" = 1 ] && fargs+=" --stream-tool-args"
