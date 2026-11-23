@@ -153,6 +153,11 @@ reasoning, so a turn reuses the prefix up to the previous assistant message.
   `max_new_tokens` is clamped so that prompt + output fits `max_context`.
 - `stop_ids` always holds EOS (1) unless the client asked to ignore it.
 - Stop strings, repetition loops and client disconnects end a request with `CANCEL`.
+- A reasoning stall (the model narrating intentions instead of acting, which the loop guard reads as
+  a loop) is `CANCEL`led and then continued as a **new** `SUBMIT`: the same conversation's prompt,
+  the reasoning it wrote, and the think block's end, so the model has to answer or call a tool. Up to
+  `--stall-recoveries` times (3), after which the request ends with an error. The continuation is a
+  separate request with its own `req_id` and session; the stalled one is retired.
 
 ## Testing without the engine
 

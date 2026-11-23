@@ -54,6 +54,9 @@ pub struct ServerConfig {
     /// the way the model was tuned, instead of over the whole vocabulary.
     pub default_top_k: u32,
     pub loop_guard: Option<LoopGuard>,
+    /// How many times a reasoning stall is recovered by closing the think block and continuing
+    /// (`--stall-recoveries`, 3). 0: a stall ends the request, as before.
+    pub stall_recoveries: u32,
     pub tokenize_threads: usize,
     /// Write each request, its prompt and its ids here, and at its end the output's ids (debugging and
     /// bench traces; holds conversation text).
@@ -385,6 +388,31 @@ pub struct Prepared {
     /// copy drafts: the texts of the request's `prediction` (OpenAI's predicted outputs), in order; empty
     /// for none or for a shape this server does not know
     pub prediction: Vec<String>,
+}
+
+impl Prepared {
+    /// The same request with a different prompt: a reasoning stall's continuation. The parser starts in
+    /// the content phase, since the prompt now ends with the think block's end.
+    fn continued(&self, prompt: String) -> Prepared {
+        Prepared {
+            prompt,
+            mode: ThinkingMode::Chat,
+            tools: self.tools,
+            stream: self.stream,
+            include_usage: self.include_usage,
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            seed: self.seed,
+            stops: self.stops.clone(),
+            stop_ids: self.stop_ids.clone(),
+            ignore_eos: self.ignore_eos,
+            images: Vec::new(),
+            rows_held: None,
+            prediction: self.prediction.clone(),
+        }
+    }
 }
 
 /// The request's `prediction` as texts: `{"type": "content", "content": "text"}` or `"content": [{"type":
@@ -816,6 +844,8 @@ struct Gen {
     parser: StreamParser,
     reasoning_stall: Option<ReasoningStall>,
     loop_detected: bool,
+    /// the loop that ended it was a reasoning stall, which a continuation can recover from
+    stalled: bool,
     dec: StreamDecoder,
     /// every id the engine sent (the session holds these)
     ids: Vec<u32>,
@@ -876,7 +906,7 @@ impl Gen {
                                 }
                             }
                             if stalled {
-                                self.abort_loop("repeated reasoning intentions");
+                                self.abort_loop("repeated reasoning intentions", true);
                             }
                         }
                     }
@@ -887,7 +917,7 @@ impl Gen {
                             let start = if from == 0 { 0 } else { self.gen_ends[from - 1] };
                             let tail = String::from_utf8_lossy(&self.gen_bytes[start..]);
                             if g.check(out_ids, &tail).is_some() {
-                                self.abort_loop("repeated output");
+                                self.abort_loop("repeated output", false);
                             }
                         }
                     }
@@ -986,9 +1016,10 @@ impl Gen {
         }
     }
 
-    fn abort_loop(&mut self, kind: &str) {
+    fn abort_loop(&mut self, kind: &str, recoverable: bool) {
         eprintln!("req {}: {kind} after {} tokens; cancelling generation", self.req_id, self.kept);
         self.loop_detected = true;
+        self.stalled = recoverable;
         self.stopped = Some(Finish::Stop);
         if !self.is_image {
             let released = self.app.sessions.lock().unwrap().retire(self.session_id);
@@ -1021,6 +1052,22 @@ impl Gen {
 
     fn parser_was_thinking(&self) -> bool {
         self.prompt_text.ends_with(crate::encoding::THINK_START)
+    }
+
+    /// The prompt that continues this request out of its reasoning block: what it was given, the
+    /// reasoning it wrote, and the think block's end. The model then has to answer or call a tool
+    /// instead of narrating the intention to. The reasoning kept is bounded and cut at a line
+    /// boundary, so a long stall cannot grow the prompt without limit; the tail is what the stall
+    /// guard found degenerate, so the head is the part worth keeping.
+    fn continuation_prompt(&self) -> String {
+        const KEEP: usize = 8192;
+        let mut s = self.prompt_text.clone();
+        let gen = String::from_utf8_lossy(&self.gen_bytes);
+        let keep = gen.len().min(KEEP);
+        let cut = gen[..keep].rfind('\n').map_or(keep, |i| i + 1);
+        s.push_str(&gen[..cut]);
+        s.push_str(crate::encoding::THINK_END);
+        s
     }
 }
 
@@ -1133,6 +1180,7 @@ async fn start(app: &Arc<App>, p: &Prepared, pass: Pass) -> Result<Gen, ApiError
         parser: parser(&app.cfg, p),
         reasoning_stall: (app.cfg.loop_guard.is_some() && p.tools).then(ReasoningStall::default),
         loop_detected: false,
+        stalled: false,
         dec: StreamDecoder::default(),
         ids: Vec::new(),
         kept: 0,
@@ -1223,6 +1271,7 @@ async fn start_images(app: &Arc<App>, p: &Prepared, pass: Pass, info: crate::pro
         parser: parser(&app.cfg, p),
         reasoning_stall: (app.cfg.loop_guard.is_some() && p.tools).then(ReasoningStall::default),
         loop_detected: false,
+        stalled: false,
         dec: StreamDecoder::default(),
         ids: Vec::new(),
         kept: 0,
@@ -1276,32 +1325,57 @@ async fn chat(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes) -> R
     if p.stream {
         return stream(app, p, req, Some(pass));
     }
-    let mut gen = match start(&app, &p, pass).await {
-        Ok(g) => g,
-        Err(e) => return e.response(),
-    };
-    dump(&app, &req, &p, &gen);
     let id = format!("chatcmpl-{}", app.random_hex(24));
     let created = now_secs();
     let model = app.cfg.model_name.clone();
     // non-streaming
+    let thinking = p.mode == ThinkingMode::Thinking;
     let mut answer = ParsedMessage::default();
-    let mut out = Vec::new();
+    let mut p = p;
+    let mut pass = Some(pass);
+    let mut attempt = 0u32;
     let (finish, usage) = loop {
-        let end = gen.next(&mut out).await;
-        out.drain(..).for_each(|d| answer.add(d));
-        match end {
-            None => continue,
-            Some(Ok(x)) => break x,
-            Some(Err(e)) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e),
-        }
+        let mut gen = match start(&app, &p, pass.take().expect("a pass per attempt")).await {
+            Ok(g) => g,
+            Err(e) => return e.response(),
+        };
+        dump(&app, &req, &p, &gen);
+        let mut out = Vec::new();
+        let end = loop {
+            let end = gen.next(&mut out).await;
+            out.drain(..).for_each(|d| answer.add(d));
+            match end {
+                None => continue,
+                Some(Ok(x)) => break Some(x),
+                Some(Err(e)) => {
+                    // as in `stream`: a reasoning stall is recoverable, an image request's is not
+                    if gen.stalled && !gen.is_image && attempt < app.cfg.stall_recoveries {
+                        break None;
+                    }
+                    return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e);
+                }
+            }
+        };
+        let Some(x) = end else {
+            let prompt = gen.continuation_prompt();
+            drop(gen); // its pass goes back to the gate before the continuation takes one
+            attempt += 1;
+            eprintln!("req: reasoning stall, continuing out of the think block (attempt {attempt} of {})", app.cfg.stall_recoveries);
+            p = p.continued(prompt);
+            pass = Some(match app.gate.enter(&app.engine).await {
+                Ok(pass) => pass,
+                Err(r) => return refused(r).response(),
+            });
+            continue;
+        };
+        break x;
     };
     let ParsedMessage { content, reasoning_content: reasoning, tool_calls } = answer;
     let calls: Vec<Value> =
         tool_calls.into_iter().map(|(name, args)| tool_call_json(app.cfg.encoding, None, app.random_hex(24), &name, args)).collect();
     let mut message = json!({"role": "assistant",
         "content": if content.is_empty() && !calls.is_empty() { Value::Null } else { json!(content) }});
-    if p.mode == ThinkingMode::Thinking {
+    if thinking {
         message["reasoning_content"] = json!(reasoning);
     }
     if !calls.is_empty() {
@@ -1336,7 +1410,7 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
                 let _ = tx.send(Event::default().data("[DONE]")).await;
             }
         };
-        let pass = match pass {
+        let mut pass = match pass {
             Some(pass) => pass,
             None => {
                 let why = if app.gate.held() { "the ring is lent to a development job" } else { "the engine is not connected" };
@@ -1353,11 +1427,6 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
                 }
             }
         };
-        let mut gen = match start(&app, &p, pass).await {
-            Ok(g) => g,
-            Err(e) => return last(e).await,
-        };
-        dump(&app, &req, &p, &gen);
         let id = format!("chatcmpl-{}", app.random_hex(24));
         let created = now_secs();
         let model = app.cfg.model_name.clone();
@@ -1369,43 +1438,72 @@ fn stream(app: Arc<App>, p: Prepared, req: Value, pass: Option<Pass>) -> Respons
         if send(chunk(json!({"role": "assistant", "content": ""}), None)).await.is_err() {
             return;
         }
-        let mut out = Vec::new();
+        let mut p = p;
+        let mut attempt = 0u32;
         loop {
-            let end = gen.next(&mut out).await;
-            for d in out.drain(..) {
-                let delta = match d {
-                    Delta::Reasoning(s) => json!({"reasoning_content": s}),
-                    Delta::Content(s) => json!({"content": s}),
-                    Delta::ToolCall(i, name, args) => {
-                        json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, args)]})
+            let mut gen = match start(&app, &p, pass).await {
+                Ok(g) => g,
+                Err(e) => return last(e).await,
+            };
+            dump(&app, &req, &p, &gen);
+            let mut out = Vec::new();
+            let mut stalled = false;
+            loop {
+                let end = gen.next(&mut out).await;
+                for d in out.drain(..) {
+                    let delta = match d {
+                        Delta::Reasoning(s) => json!({"reasoning_content": s}),
+                        Delta::Content(s) => json!({"content": s}),
+                        Delta::ToolCall(i, name, args) => {
+                            json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, args)]})
+                        }
+                        // in pieces, as OpenAI streams a call: its id, type and name with empty arguments,
+                        // then chunks that carry its index and the next of its arguments
+                        Delta::ToolCallStart(i, name) => {
+                            json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, String::new())]})
+                        }
+                        Delta::ToolArgs(i, piece) => json!({"tool_calls": [{"index": i, "function": {"arguments": piece}}]}),
+                    };
+                    if send(chunk(delta, None)).await.is_err() {
+                        return; // client gone; dropping gen cancels the request
                     }
-                    // in pieces, as OpenAI streams a call: its id, type and name with empty arguments,
-                    // then chunks that carry its index and the next of its arguments
-                    Delta::ToolCallStart(i, name) => {
-                        json!({"tool_calls": [tool_call_json(app.cfg.encoding, Some(i), app.random_hex(24), &name, String::new())]})
+                }
+                match end {
+                    None => continue,
+                    Some(Ok((finish, usage))) => {
+                        let _ = send(chunk(json!({}), Some(finish.as_str()))).await;
+                        if p.include_usage {
+                            let _ = send(json!({"id": id, "object": "chat.completion.chunk", "created": created,
+                                                "model": model, "choices": [], "usage": usage.json()}))
+                            .await;
+                        }
+                        break;
                     }
-                    Delta::ToolArgs(i, piece) => json!({"tool_calls": [{"index": i, "function": {"arguments": piece}}]}),
-                };
-                if send(chunk(delta, None)).await.is_err() {
-                    return; // client gone; dropping gen cancels the request
+                    Some(Err(e)) => {
+                        // A reasoning stall is recoverable: close the think block and let the model
+                        // answer or call a tool, instead of ending the request for the client to retry.
+                        // An image request is not: its continuation would carry placeholders without rows.
+                        if gen.stalled && !gen.is_image && attempt < app.cfg.stall_recoveries {
+                            stalled = true;
+                            break;
+                        }
+                        let _ = send(json!({"error": {"message": e, "type": "server_error", "param": null, "code": 500}})).await;
+                        break;
+                    }
                 }
             }
-            match end {
-                None => continue,
-                Some(Ok((finish, usage))) => {
-                    let _ = send(chunk(json!({}), Some(finish.as_str()))).await;
-                    if p.include_usage {
-                        let _ = send(json!({"id": id, "object": "chat.completion.chunk", "created": created,
-                                            "model": model, "choices": [], "usage": usage.json()}))
-                        .await;
-                    }
-                    break;
-                }
-                Some(Err(e)) => {
-                    let _ = send(json!({"error": {"message": e, "type": "server_error", "param": null, "code": 500}})).await;
-                    break;
-                }
+            if !stalled {
+                break;
             }
+            let prompt = gen.continuation_prompt();
+            drop(gen); // its pass goes back to the gate before the continuation takes one
+            attempt += 1;
+            eprintln!("req: reasoning stall, continuing out of the think block (attempt {attempt} of {})", app.cfg.stall_recoveries);
+            p = p.continued(prompt);
+            pass = match app.gate.enter(&app.engine).await {
+                Ok(pass) => pass,
+                Err(r) => return last(refused(r)).await,
+            };
         }
         let _ = tx.send(Event::default().data("[DONE]")).await;
     });
@@ -1434,6 +1532,7 @@ pub(crate) mod tests {
             default_top_p: 0.95,
             default_top_k: 20,
             loop_guard: None,
+            stall_recoveries: 3,
             tokenize_threads: 1,
             dump_dir: None,
             protocol_error_dir: None,

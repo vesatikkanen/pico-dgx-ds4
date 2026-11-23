@@ -177,7 +177,10 @@ run can read (golden/README.md, "Checking a build").
 **m6: two front-end behaviours that change what an API client sees are documented only in passing.**
 dsfront's loop guard (on by default, with the kit's loop-abort defaults; `--no-loop-guard` in its
 `--help`) cuts a repetitive generation short and reports `finish_reason` "stop"; protocol.md says only
-that the front-end cancels a repetition loop. The API accepts `logprobs`/`top_logprobs` but always
+that the front-end cancels a repetition loop. A *reasoning* stall — the model narrating intentions
+instead of acting — is not terminal: the front-end cancels it and continues the conversation out of
+the think block, up to `--stall-recoveries` times (3), so the client sees one answer rather than an
+error to retry. The API accepts `logprobs`/`top_logprobs` but always
 returns `null` (dsfront never asks the engine for them, although the protocol and the engine carry
 them). Neither changes a token that is sent; both deserve a line where API users look.
 

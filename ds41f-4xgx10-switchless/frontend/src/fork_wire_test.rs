@@ -166,6 +166,8 @@ mod fork_wire {
         let mut peer = connect(&listener, &engine).await;
         let mut config = cfg();
         config.loop_guard = Some(LoopGuard::default());
+        // the guard's own behaviour: no recovery, so the abort is what the client sees
+        config.stall_recoveries = 0;
         let app = App::new(config, tokenizer(), engine);
         let body = json!({
             "messages": [{"role": "user", "content": "Read the documentation"}],
@@ -211,6 +213,145 @@ mod fork_wire {
     async fn reasoning_loop_returns_error_and_releases_session() {
         reasoning_loop_response(false).await;
         reasoning_loop_response(true).await;
+    }
+
+    /// The `delta.content` of an SSE body, concatenated.
+    fn streamed_content(body: &str) -> String {
+        let mut out = String::new();
+        for line in body.lines() {
+            let Some(rest) = line.strip_prefix("data: ") else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(rest) else { continue };
+            if let Some(s) = v["choices"][0]["delta"]["content"].as_str() {
+                out.push_str(s);
+            }
+        }
+        out
+    }
+
+    /// A reasoning stall is recoverable: the frontend closes the think block and asks again, so the
+    /// client gets an answer instead of an error it has to retry by hand.
+    async fn reasoning_stall_recovers(stream: bool) {
+        use crate::protocol::Tokens;
+
+        let path = SocketPath(std::env::temp_dir().join(format!(
+            "pico-stall-recover-{}-{stream}.sock", std::process::id()
+        )));
+        let listener = UnixListener::bind(&path.0).unwrap();
+        let engine = EngineClient::start(path.0.clone());
+        let mut peer = connect(&listener, &engine).await;
+        let mut config = cfg();
+        config.loop_guard = Some(LoopGuard::default());
+        config.stall_recoveries = 1;
+        let app = App::new(config, tokenizer(), engine);
+        let body = json!({
+            "messages": [{"role": "user", "content": "Read the documentation"}],
+            "thinking": {"type": "enabled"}, "stream": stream, "max_tokens": 2048,
+            "tools": [{"type": "function", "function": {"name": "read_doc",
+                "description": "Read a document", "parameters": {"type": "object", "properties": {}}}}]
+        });
+        let request = tokio::spawn({
+            let app = app.clone();
+            async move {
+                let response = chat(State(app), HeaderMap::new(), Bytes::from(body.to_string())).await;
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                (status, bytes)
+            }
+        });
+
+        // the stall: short action-announcing lines, which the guard reads as a loop
+        let first = submit(&mut peer).await;
+        let lines = ["Let me read the docs.", "OK.", "Let me write the calls.",
+            "Making calls.", "Let me go.", "Writing now."];
+        let text = (0..24).map(|i| format!("{}\n\n", lines[i % lines.len()])).collect::<String>();
+        let ids = app.tok.encode_parallel(&text, 1);
+        for chunk in ids.chunks(if stream { 37 } else { ids.len() }) {
+            peer.write_all(&Frame::Tokens(Tokens {
+                req_id: first.req_id, ids: chunk.to_vec(), logprobs: None, top: None,
+            }).encode()).await.unwrap();
+        }
+        assert_eq!(receive(&mut peer).await, Frame::Cancel { req_id: first.req_id });
+        done(&mut peer, &first, DoneReason::Cancelled).await;
+        assert_eq!(receive(&mut peer).await, Frame::Release { session_id: first.session_id });
+
+        // the continuation: the same conversation, the reasoning it wrote, and the think block's end
+        let second = submit(&mut peer).await;
+        assert_ne!(second.session_id, first.session_id);
+        let prompt = app.tok.decode(&second.prompt);
+        assert!(prompt.contains("Read the documentation"), "{prompt}");
+        assert!(prompt.contains("Let me read the docs."), "{prompt}");
+        assert!(prompt.ends_with(THINK_END), "{prompt}");
+        let answer = app.tok.encode_parallel("The docs say so.", 1);
+        peer.write_all(&Frame::Tokens(Tokens {
+            req_id: second.req_id, ids: answer, logprobs: None, top: None,
+        }).encode()).await.unwrap();
+        done(&mut peer, &second, DoneReason::Length).await;
+
+        let (status, bytes) = timeout(DEADLINE, request).await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::OK);
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let answer = if stream { streamed_content(&body) } else { body.clone() };
+        assert!(answer.contains("The docs say so."), "{body}");
+        assert!(!body.contains("repetition loop detected"), "{body}");
+        assert!(!body.contains("\"error\""), "{body}");
+        if stream {
+            assert!(body.contains("[DONE]"), "{body}");
+        }
+        // the continuation's session is kept for the conversation's next turn
+        assert_eq!(app.sessions.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reasoning_stall_continues_out_of_the_think_block() {
+        reasoning_stall_recovers(false).await;
+        reasoning_stall_recovers(true).await;
+    }
+
+    /// The recovery is bounded: with one attempt allowed, a second stall ends the request.
+    #[tokio::test]
+    async fn reasoning_stall_recovery_is_bounded() {
+        use crate::protocol::Tokens;
+
+        let path = SocketPath(std::env::temp_dir().join(format!(
+            "pico-stall-bounded-{}.sock", std::process::id()
+        )));
+        let listener = UnixListener::bind(&path.0).unwrap();
+        let engine = EngineClient::start(path.0.clone());
+        let mut peer = connect(&listener, &engine).await;
+        let mut config = cfg();
+        config.loop_guard = Some(LoopGuard::default());
+        config.stall_recoveries = 1;
+        let app = App::new(config, tokenizer(), engine);
+        let body = json!({
+            "messages": [{"role": "user", "content": "Read the documentation"}],
+            "thinking": {"type": "enabled"}, "stream": true, "max_tokens": 2048,
+            "tools": [{"type": "function", "function": {"name": "read_doc",
+                "description": "Read a document", "parameters": {"type": "object", "properties": {}}}}]
+        });
+        let request = tokio::spawn({
+            let app = app.clone();
+            async move {
+                let response = chat(State(app), HeaderMap::new(), Bytes::from(body.to_string())).await;
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                String::from_utf8(bytes.to_vec()).unwrap()
+            }
+        });
+        let text = (0..24).map(|i| format!("{}\n\n", ["Let me go.", "OK."][i % 2])).collect::<String>();
+        let ids = app.tok.encode_parallel(&text, 1);
+        for _ in 0..2 {
+            let submitted = submit(&mut peer).await;
+            for chunk in ids.chunks(37) {
+                peer.write_all(&Frame::Tokens(Tokens {
+                    req_id: submitted.req_id, ids: chunk.to_vec(), logprobs: None, top: None,
+                }).encode()).await.unwrap();
+            }
+            assert_eq!(receive(&mut peer).await, Frame::Cancel { req_id: submitted.req_id });
+            done(&mut peer, &submitted, DoneReason::Cancelled).await;
+            assert_eq!(receive(&mut peer).await, Frame::Release { session_id: submitted.session_id });
+        }
+        let body = timeout(DEADLINE, request).await.unwrap().unwrap();
+        assert!(body.contains("repetition loop detected"), "{body}");
+        assert!(!body.contains("\"finish_reason\":\"stop\""), "{body}");
     }
 
     #[tokio::test]
